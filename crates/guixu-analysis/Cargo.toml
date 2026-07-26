@@ -1,0 +1,15 @@
+[package]
+name = "guixu-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+guixu-platform = { path = "../guixu-platform" }
+blake3.workspace = true
+thiserror.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

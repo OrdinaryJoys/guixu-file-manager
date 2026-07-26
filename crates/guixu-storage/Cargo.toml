@@ -1,0 +1,15 @@
+[package]
+name = "guixu-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+guixu-domain = { path = "../guixu-domain" }
+rusqlite.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

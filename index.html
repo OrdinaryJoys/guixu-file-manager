@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>归序 · 本地文件整理</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="style.css" />
+    <link rel="stylesheet" href="enhancements.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="#workspace"><span class="brand-mark">⌁</span><span>归序</span></a>
+        <nav>
+          <a class="nav-item active" href="#workspace"><span>▦</span>工作台</a>
+          <a class="nav-item" href="#rules"><span>⌘</span>整理规则</a>
+          <a class="nav-item" href="#insights"><span>◉</span>空间分析</a>
+          <a class="nav-item" href="#automations"><span>◷</span>自动化</a>
+          <a class="nav-item" href="#history"><span>↶</span>操作记录</a>
+        </nav>
+        <div class="sidebar-bottom">
+          <button class="help-button" id="helpButton"><span>?</span>使用说明</button>
+          <p>所有文件仅在本机处理<br />不会上传至任何服务器</p>
+        </div>
+      </aside>
+
+      <section class="workspace" id="workspace">
+        <header class="topbar">
+          <div class="crumb"><span class="eyebrow" id="pageEyebrow">LOCAL ORGANIZER</span><h1 id="pageTitle">整理工作台</h1></div>
+          <div class="status-pill"><i></i><span id="statusText">等待选择文件夹</span></div>
+        </header>
+
+        <div class="content">
+          <section class="hero panel" id="folderPanel">
+            <div class="hero-copy">
+              <p class="eyebrow">01 · 选择位置</p>
+              <h2>让杂乱的文件<br />各归其位。</h2>
+              <p class="muted">选择一个本地文件夹。归序会先分析内容，生成整理预览；只有在你确认后才会移动文件。</p>
+              <div class="path-entry folder-picker-entry"><input id="folderPath" type="hidden" /><button class="primary-button" id="pickFolder"><span>▰</span>选择文件夹</button></div>
+              <p class="browser-note" id="browserNote">点击后将打开 macOS 文件夹选择器；选定后自动生成整理预览</p>
+            </div>
+            <div class="folder-illustration" aria-hidden="true">
+              <div class="orbit orbit-1"></div><div class="orbit orbit-2"></div>
+              <div class="file-card card-a">PDF <span>报告</span></div>
+              <div class="file-card card-b">JPG <span>照片</span></div>
+              <div class="folder-shape"><span></span></div>
+              <div class="file-card card-c">ZIP <span>归档</span></div>
+            </div>
+          </section>
+
+          <section class="analysis hidden" id="analysisPanel">
+            <div class="folder-summary panel">
+              <div class="selected-folder"><div class="folder-icon">▰</div><div><p class="eyebrow">已选文件夹</p><h3 id="folderName">—</h3></div></div>
+              <div class="summary-actions"><span id="fileCount">0 个文件</span><button class="text-button" id="changeFolder">更换</button></div>
+            </div>
+
+            <div class="section-heading"><div><p class="eyebrow">02 · 设置规则</p><h2>如何整理？</h2></div><button class="text-button" id="rescan">重新扫描</button></div>
+            <div class="rule-grid" id="ruleGrid">
+              <button class="rule-card selected" data-rule="type"><span class="rule-icon blue">◫</span><strong>按文件类型</strong><small>图片、文档、音频等</small><b>✓</b></button>
+              <button class="rule-card" data-rule="date"><span class="rule-icon orange">◷</span><strong>按修改日期</strong><small>按年 / 月创建文件夹</small><b>✓</b></button>
+              <button class="rule-card" data-rule="name"><span class="rule-icon green">Aa</span><strong>按名称首字母</strong><small>A–Z / 其他</small><b>✓</b></button>
+              <button class="rule-card" data-rule="custom"><span class="rule-icon blue">⌘</span><strong>自定义规则</strong><small>使用规则库的优先级规则</small><b>✓</b></button>
+            </div>
+            <div class="options-row panel">
+              <label class="switch-label"><input type="checkbox" id="skipFolders" checked /><span class="switch"></span><span><strong>只整理根目录</strong><small>不扫描已有子文件夹</small></span></label>
+              <label class="switch-label"><input type="checkbox" id="ignoreHidden" checked /><span class="switch"></span><span><strong>忽略隐藏文件</strong><small>以“.”开头的文件不会处理</small></span></label>
+            </div>
+            <div class="preview-head"><div><p class="eyebrow">03 · 整理预览</p><h2>即将执行的变动</h2></div><span class="move-count" id="moveCount">0 项待移动</span></div>
+            <div class="preview panel"><div class="preview-list" id="previewList"></div><div class="empty-preview hidden" id="emptyPreview">当前文件夹已经很整齐，没有需要移动的文件。</div></div>
+            <div class="execute-bar panel"><div><strong id="executeTitle">准备就绪</strong><p id="executeSub">确认预览后即可开始整理</p></div><button class="primary-button" id="organizeButton" disabled>确认并整理 <span>→</span></button></div>
+          </section>
+
+          <section class="rules-page hidden" id="rulesPage">
+            <div class="section-heading"><div><p class="eyebrow">规则库</p><h2>自定义整理规则</h2></div><button class="primary-button compact" id="newRule">＋ 新建规则</button></div>
+            <p class="rules-intro">规则按优先级从高到低匹配。命中的第一条规则决定文件的目标位置；自动规则仍会先进入预览队列。</p>
+            <div class="rules-layout">
+              <form class="rule-form panel hidden" id="ruleForm">
+                <input type="hidden" id="ruleId" />
+                <div class="form-head"><strong id="ruleFormTitle">新建规则</strong><button type="button" class="text-button" id="cancelRule">取消</button></div>
+                <label>规则名称<input id="ruleName" maxlength="80" placeholder="例如：发票归档" required /></label>
+                <div class="form-two"><label>优先级<input id="rulePriority" type="number" min="0" max="9999" value="100" /></label><label>运行方式<select id="ruleMode"><option value="preview">预览后执行</option><option value="auto">自动队列</option></select></label></div>
+                <label>扩展名（逗号分隔）<input id="ruleExtensions" placeholder="pdf, docx" /></label>
+                <label>文件名包含<input id="ruleNameContains" placeholder="例如：发票" /></label>
+                <div class="form-two"><label>最小大小（字节）<input id="ruleMinSize" type="number" min="0" /></label><label>至少存放（天）<input id="ruleOlderDays" type="number" min="0" /></label></div>
+                <label>目标目录模板<input id="ruleDestination" placeholder="财务/{YYYY}/{MM}" required /><small>可用：{category}、{YYYY}、{MM}、{ext}、{initial}</small></label>
+                <label class="inline-check"><input id="ruleEnabled" type="checkbox" checked />启用此规则</label>
+                <button class="primary-button" type="submit">保存规则 <span>→</span></button>
+              </form>
+              <div class="rule-list" id="ruleList"></div>
+            </div>
+          </section>
+
+          <section class="insights-page hidden" id="insightsPage">
+            <div class="section-heading"><div><p class="eyebrow">文件洞察</p><h2>空间与完整性分析</h2></div><button class="primary-button compact" id="runAnalysis">开始分析</button></div>
+            <p class="rules-intro">分析使用增量哈希缓存；只生成报告，不移动或删除任何文件。</p>
+            <div class="insight-stats" id="insightStats">
+              <div class="panel stat-card"><small>扫描文件</small><strong id="statScanned">—</strong></div>
+              <div class="panel stat-card"><small>重复组</small><strong id="statDuplicates">—</strong></div>
+              <div class="panel stat-card"><small>可回收空间</small><strong id="statReclaimable">—</strong></div>
+              <div class="panel stat-card"><small>异常项</small><strong id="statWarnings">—</strong></div>
+            </div>
+            <div class="analysis-results">
+              <section><h3>精确重复文件</h3><div id="duplicateResults" class="result-list panel"><div class="empty-preview">点击“开始分析”生成报告</div></div></section>
+              <section><h3>最大文件</h3><div id="largestResults" class="result-list panel"><div class="empty-preview">等待分析</div></div></section>
+              <section><h3>空文件与扩展名异常</h3><div id="warningResults" class="result-list panel"><div class="empty-preview">等待分析</div></div></section>
+            </div>
+          </section>
+
+          <section class="automations-page hidden" id="automationsPage">
+            <div class="section-heading"><div><p class="eyebrow">受控自动化</p><h2>监听与定时任务</h2></div><button class="primary-button compact" id="newAutomation">＋ 新建任务</button></div>
+            <p class="rules-intro">监听任务不会处理启用前已有文件；新文件连续两次检查稳定后才进入规则。自动执行需单独选择。</p>
+            <div class="rules-layout">
+              <form class="rule-form panel hidden" id="automationForm">
+                <input type="hidden" id="automationId" />
+                <div class="form-head"><strong id="automationFormTitle">新建任务</strong><button type="button" class="text-button" id="cancelAutomation">取消</button></div>
+                <label>任务名称<input id="automationName" maxlength="80" placeholder="例如：下载目录监听" required /></label>
+                <label>文件夹路径<input id="automationPath" placeholder="/Users/你的名字/Downloads" required /></label>
+                <div class="form-two"><label>运行类型<select id="automationKind"><option value="watch">监听新文件</option><option value="schedule">定时整理</option></select></label><label>运行方式<select id="automationMode"><option value="preview">等待确认</option><option value="auto">自动执行</option></select></label></div>
+                <label>检查间隔（秒）<input id="automationInterval" type="number" min="10" value="60" required /></label>
+                <label class="inline-check"><input id="automationRecursive" type="checkbox" />包含子文件夹</label>
+                <label class="inline-check"><input id="automationEnabled" type="checkbox" checked />启用任务</label>
+                <button class="primary-button" type="submit">保存任务 <span>→</span></button>
+              </form>
+              <div class="automation-list" id="automationList"></div>
+            </div>
+            <div class="section-heading automation-runs-head"><div><p class="eyebrow">运行日志</p><h2>最近检查</h2></div></div>
+            <div class="panel" id="automationRuns"><div class="empty-preview">还没有运行记录</div></div>
+          </section>
+
+          <section class="history hidden" id="history"><div class="section-heading"><div><p class="eyebrow">活动记录</p><h2>最近操作</h2></div></div><div class="history-list panel" id="historyList"></div></section>
+        </div>
+      </section>
+    </main>
+    <div class="toast" id="toast"></div>
+    <dialog id="helpDialog"><button class="close-dialog" id="closeHelp">×</button><p class="eyebrow">使用说明</p><h2>安全地整理你的文件</h2><ol><li>选择需要整理的文件夹并授权访问。</li><li>选择规则，查看将要移动的文件预览。</li><li>点击“确认并整理”，文件将移动到自动创建的分类文件夹中。</li></ol><p>同名文件会自动加上编号，原有子文件夹不会被覆盖。</p></dialog>
+    <script src="app.js"></script>
+  </body>
+</html>

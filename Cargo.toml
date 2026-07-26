@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/guixu-domain",
+  "crates/guixu-platform",
+  "crates/guixu-operations",
+  "crates/guixu-indexer",
+  "crates/guixu-analysis",
+  "crates/guixu-storage",
+  "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+blake3 = "1"
+libc = "0.2"
+notify = "8.2"
+unicode-normalization = "0.1"

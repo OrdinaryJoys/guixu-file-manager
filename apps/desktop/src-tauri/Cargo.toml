@@ -1,0 +1,28 @@
+[package]
+name = "guixu-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "guixu_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+guixu-analysis = { path = "../../../crates/guixu-analysis" }
+guixu-domain = { path = "../../../crates/guixu-domain" }
+guixu-indexer = { path = "../../../crates/guixu-indexer" }
+guixu-operations = { path = "../../../crates/guixu-operations" }
+guixu-platform = { path = "../../../crates/guixu-platform" }
+guixu-storage = { path = "../../../crates/guixu-storage" }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+
+[dev-dependencies]
+tempfile = "3"
