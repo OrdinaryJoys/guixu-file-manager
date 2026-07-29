@@ -16,7 +16,7 @@
 
 ### 2.1 图片
 
-- 默认使用 64 位 dHash，并增加旋转/裁剪归一化与多尺度 pHash，覆盖截图、导出副本和轻微压缩。
+- 当前默认一次解码生成 64 位 dHash 与 32×32 灰度低频 DCT pHash，已覆盖缩放和轻微 JPEG 压缩复核；旋转、裁剪归一化和多尺度特征仍是后续增强项。
 - macOS 增强 provider 使用 Apple Vision `VNGenerateImageFeaturePrintRequest`；系统直接提供特征距离计算。
 - 跨平台可选 MobileCLIP2 小模型，用于端侧图片语义和图文检索。官方模型族以 3–15ms 延迟、50–150M 参数为目标。
 - SigLIP 2 改善多语言图文检索，但最小 ViT-B 仍约 86M 参数，因此作为可下载模型包，而不是基础安装依赖。
@@ -26,7 +26,7 @@
 
 ### 2.2 文本
 
-默认层使用 Unicode NFKC、语言无关字符 shingles、SimHash 和 MinHash：SimHash 处理局部编辑，MinHash + LSH 处理长文档集合相似度和段落重排。PDF/Office 文本绑定文件快照与解析器版本。
+默认层使用 Unicode NFKC、语言无关字符 shingles、SimHash 和 MinHash：SimHash 负责 64 位候选召回，32 分量字符五元组 MinHash 独立复核集合相似度。当前文本读取绑定文件快照与特征版本；PDF/Office 正文解析器仍待接入。
 
 语义增强采用可选 EmbeddingGemma provider。它面向端侧、覆盖 100 多种语言，并支持 Matryoshka 768/512/256/128 维输出。归序默认保存归一化 128 维向量用于召回，再以 256/768 维重排。量化内存仍接近 200MB，因此模型必须由用户明确下载。
 
@@ -36,7 +36,7 @@
 
 | 规模 | 索引 | 用途 |
 | --- | --- | --- |
-| 64 位二进制哈希 | 9 段倒排 LSH | 当前已实现；完整召回汉明距离 ≤8 |
+| 64 位二进制哈希 | 三段 Multi-Index Hashing | 当前已实现；21/21/22 位分段枚举 0–2 位邻域，完整召回汉明距离 ≤8 |
 | 向量少于 50k | 分块 SIMD 精确余弦 top-k | 稳定结果与 ANN 基准 |
 | 50k–1M | HNSW + 精确重排 | 增量更新和高召回低延迟 |
 | 超大/低内存 | 量化向量 + 磁盘分区 | 达到基准门后再引入 |
@@ -107,8 +107,8 @@ provider 不接收 UI 传入的任意路径，只接收核心重新授权后的�
 ## 8. 实施顺序
 
 1. schema 11：特征、运行记录和候选边。**已完成。**
-2. 文本 SimHash、图片 dHash、快照缓存、持久可控任务与 Web/App 统一只读候选 UI。**已完成基础版；EXIF 方向归一化、MinHash/pHash 二次验证待接入。**
-3. 精确搜索基准和阈值数据集。**下一检查点。**
+2. 文本 SimHash/MinHash、图片 dHash/pHash、EXIF 方向归一化、快照缓存、持久可控任务与 Web/App 统一只读候选 UI。**已完成双阶段基础版。**
+3. 精确候选基准和阈值评估器。**已完成 10k/100k 合成哈希基线与网格阈值指标；真实标注集是下一检查点。**
 4. macOS Vision provider；真机基准通过后启用。
 5. 可选 EmbeddingGemma 128D 与 MobileCLIP2 provider，模型包独立下载校验。
 6. 50k 向量以上启用 HNSW，并以精确 top-k 持续监测召回。

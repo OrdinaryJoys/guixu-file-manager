@@ -191,8 +191,8 @@ const invoke = window.__TAURI__?.core?.invoke || (async (command, args = {}) => 
   if (command === 'start_similarity_analysis' && browserDemo) {
     const id = `demo-similarity-${args.contentKind}-${Date.now()}`;
     const report = args.contentKind === 'image'
-      ? { contentKind: 'image', inputFiles: 2, computedFeatures: 1, cacheHits: 1, skippedFiles: 0, pairs: [{ leftFileId: 'demo-3', leftPath: '/本地演示/产品截图.png', rightFileId: 'demo-5', rightPath: '/本地演示/导出/产品截图-压缩.webp', hammingDistance: 3, similarity: 0.953125 }] }
-      : { contentKind: 'text', inputFiles: 3, computedFeatures: 1, cacheHits: 2, skippedFiles: 0, pairs: [{ leftFileId: 'demo-1', leftPath: '/本地演示/项目说明.md', rightFileId: 'demo-4', rightPath: '/本地演示/备份/项目说明 copy.md', hammingDistance: 4, similarity: 0.9375 }] };
+      ? { contentKind: 'image', inputFiles: 2, computedFeatures: 1, cacheHits: 1, skippedFiles: 0, candidatePairs: 1, secondaryVerifiedPairs: 1, featureMs: 18, candidateMs: 1, algorithmProfile: 'dhash64-mih3-r8+phash64-r12-v1', pairs: [{ leftFileId: 'demo-3', leftPath: '/本地演示/产品截图.png', rightFileId: 'demo-5', rightPath: '/本地演示/导出/产品截图-压缩.webp', hammingDistance: 3, secondaryDistance: 5, secondarySimilarity: 0.921875, similarity: 0.934375, verification: 'dHash 候选 + DCT pHash 复核' }] }
+      : { contentKind: 'text', inputFiles: 3, computedFeatures: 1, cacheHits: 2, skippedFiles: 0, candidatePairs: 1, secondaryVerifiedPairs: 1, featureMs: 4, candidateMs: 1, algorithmProfile: 'simhash64-mih3-r8+minhash32-v1', pairs: [{ leftFileId: 'demo-1', leftPath: '/本地演示/项目说明.md', rightFileId: 'demo-4', rightPath: '/本地演示/备份/项目说明 copy.md', hammingDistance: 4, secondaryDistance: null, secondarySimilarity: 0.8125, similarity: 0.86875, verification: 'SimHash 候选 + MinHash 字符五元组复核' }] };
     demoSimilarityResults.set(id, report);
     demoJobs = [{ id, kind: args.contentKind === 'image' ? 'similar_image_analysis' : 'similar_text_analysis', status: 'completed', progressCurrent: demoFiles.length, progressTotal: demoFiles.length, updatedAtMs: Date.now() }, ...demoJobs];
     return id;
@@ -200,13 +200,13 @@ const invoke = window.__TAURI__?.core?.invoke || (async (command, args = {}) => 
   if (command === 'similarity_result' && browserDemo) return demoSimilarityResults.get(args.jobId) || null;
   if (command === 'similar_texts' && browserDemo) return {
     contentKind: 'text',
-    inputFiles: 3, computedFeatures: 1, cacheHits: 2, skippedFiles: 0,
-    pairs: [{ leftFileId: 'demo-1', leftPath: '/本地演示/项目说明.md', rightFileId: 'demo-4', rightPath: '/本地演示/备份/项目说明 copy.md', hammingDistance: 4, similarity: 0.9375 }],
+    inputFiles: 3, computedFeatures: 1, cacheHits: 2, skippedFiles: 0, candidatePairs: 1, secondaryVerifiedPairs: 1, featureMs: 4, candidateMs: 1, algorithmProfile: 'simhash64-mih3-r8+minhash32-v1',
+    pairs: [{ leftFileId: 'demo-1', leftPath: '/本地演示/项目说明.md', rightFileId: 'demo-4', rightPath: '/本地演示/备份/项目说明 copy.md', hammingDistance: 4, secondaryDistance: null, secondarySimilarity: 0.8125, similarity: 0.86875, verification: 'SimHash 候选 + MinHash 字符五元组复核' }],
   };
   if (command === 'similar_images' && browserDemo) return {
     contentKind: 'image',
-    inputFiles: 2, computedFeatures: 1, cacheHits: 1, skippedFiles: 0,
-    pairs: [{ leftFileId: 'demo-3', leftPath: '/本地演示/产品截图.png', rightFileId: 'demo-5', rightPath: '/本地演示/导出/产品截图-压缩.webp', hammingDistance: 3, similarity: 0.953125 }],
+    inputFiles: 2, computedFeatures: 1, cacheHits: 1, skippedFiles: 0, candidatePairs: 1, secondaryVerifiedPairs: 1, featureMs: 18, candidateMs: 1, algorithmProfile: 'dhash64-mih3-r8+phash64-r12-v1',
+    pairs: [{ leftFileId: 'demo-3', leftPath: '/本地演示/产品截图.png', rightFileId: 'demo-5', rightPath: '/本地演示/导出/产品截图-压缩.webp', hammingDistance: 3, secondaryDistance: 5, secondarySimilarity: 0.921875, similarity: 0.934375, verification: 'dHash 候选 + DCT pHash 复核' }],
   };
   if (command === 'search_files') return browserDemo ? searchDemoFiles(args.query || '') : [];
   if (command === 'smart_folders') return browserDemo ? demoSmartFolders : [];
@@ -1382,7 +1382,8 @@ async function loadSimilarContent(kind = 'text', openDialog = true) {
 
 function renderSimilarContent(report) {
   const isImage = report.contentKind === 'image';
-  elements.similarTextsSummary.textContent = `分析 ${report.inputFiles} 个${isImage ? '图片' : '文本'}文件；新计算 ${report.computedFeatures} 个特征，缓存命中 ${report.cacheHits} 个，跳过 ${report.skippedFiles} 个。相似候选只供比较，不代表内容完全相同。`;
+  const elapsed = Number(report.featureMs || 0) + Number(report.candidateMs || 0);
+  elements.similarTextsSummary.textContent = `分析 ${report.inputFiles} 个${isImage ? '图片' : '文本'}文件；新计算 ${report.computedFeatures} 个特征，缓存命中 ${report.cacheHits} 个，跳过 ${report.skippedFiles} 个；初筛 ${report.candidatePairs ?? report.pairs.length} 对，二次验证保留 ${report.secondaryVerifiedPairs ?? report.pairs.length} 对，用时 ${elapsed} ms。候选只供比较，不代表内容完全相同。`;
   elements.similarTextsList.replaceChildren();
   if (report.pairs.length === 0) {
     const empty = document.createElement('div');
@@ -1400,7 +1401,9 @@ function renderSimilarContent(report) {
     title.textContent = `${Math.round(pair.similarity * 100)}% 相似`;
     const distance = document.createElement('span');
     distance.className = 'status-pill';
-    distance.textContent = `汉明距离 ${pair.hammingDistance}`;
+    distance.textContent = pair.secondaryDistance == null
+      ? `SimHash ${pair.hammingDistance} · MinHash ${Math.round((pair.secondarySimilarity || 0) * 100)}%`
+      : `dHash ${pair.hammingDistance} · pHash ${pair.secondaryDistance}`;
     head.append(title, distance);
     const paths = document.createElement('div');
     paths.className = 'duplicate-paths';
@@ -1413,7 +1416,9 @@ function renderSimilarContent(report) {
       row.append(value);
       paths.append(row);
     });
-    card.append(head, paths);
+    const evidence = document.createElement('p');
+    evidence.textContent = pair.verification || report.algorithmProfile || '双层本地特征验证';
+    card.append(head, paths, evidence);
     elements.similarTextsList.append(card);
   });
 }

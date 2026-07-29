@@ -435,6 +435,67 @@ pub fn text_simhash(text: &str) -> Option<u64> {
     )
 }
 
+pub const TEXT_MINHASH_COMPONENTS: usize = 32;
+const MAX_MINHASH_FEATURES: usize = 32 * 1024;
+
+/// 为文本字符五元组生成固定大小 MinHash 签名，用于 SimHash 候选的二次验证。
+///
+/// 特征按哈希值确定性截断，避免超大文本造成无界内存或 CPU 开销。
+pub fn text_minhash(text: &str) -> Option<[u64; TEXT_MINHASH_COMPONENTS]> {
+    let characters = text
+        .nfkc()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect::<Vec<_>>();
+    if characters.is_empty() {
+        return None;
+    }
+    let shingles = if characters.len() < 5 {
+        vec![characters.iter().collect::<String>()]
+    } else {
+        characters
+            .windows(5)
+            .map(|window| window.iter().collect::<String>())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    let mut feature_hashes = shingles
+        .into_iter()
+        .map(|feature| {
+            let digest = blake3::hash(feature.as_bytes());
+            (
+                u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("eight bytes")),
+                u64::from_le_bytes(digest.as_bytes()[8..16].try_into().expect("eight bytes")) | 1,
+            )
+        })
+        .collect::<Vec<_>>();
+    feature_hashes.sort_unstable();
+    feature_hashes.truncate(MAX_MINHASH_FEATURES);
+    let mut signature = [u64::MAX; TEXT_MINHASH_COMPONENTS];
+    for (first, second) in feature_hashes {
+        for (index, minimum) in signature.iter_mut().enumerate() {
+            let permuted = first
+                .wrapping_add((index as u64).wrapping_mul(second))
+                .rotate_left((index % 63) as u32);
+            *minimum = (*minimum).min(permuted);
+        }
+    }
+    Some(signature)
+}
+
+pub fn minhash_similarity(
+    left: &[u64; TEXT_MINHASH_COMPONENTS],
+    right: &[u64; TEXT_MINHASH_COMPONENTS],
+) -> f32 {
+    let equal = left
+        .iter()
+        .zip(right)
+        .filter(|(left, right)| left == right)
+        .count();
+    equal as f32 / TEXT_MINHASH_COMPONENTS as f32
+}
+
 pub fn hash_similarity(left: u64, right: u64) -> f32 {
     1.0 - ((left ^ right).count_ones() as f32 / 64.0)
 }
@@ -451,6 +512,106 @@ pub struct SimilarityCandidate {
     pub right_id: String,
     pub hamming_distance: u32,
     pub similarity: f32,
+}
+
+/// 一条已人工确认的相似度样本。主距离越小、二次相似度越高，越可能为近重复。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LabeledSimilaritySample {
+    pub primary_distance: u32,
+    pub secondary_similarity: f32,
+    pub is_match: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThresholdMetrics {
+    pub maximum_primary_distance: u32,
+    pub minimum_secondary_similarity: f32,
+    pub true_positives: usize,
+    pub false_positives: usize,
+    pub true_negatives: usize,
+    pub false_negatives: usize,
+    pub precision: f32,
+    pub recall: f32,
+    pub f1: f32,
+}
+
+/// 评估双阶段门限。没有正预测或正样本时相应指标返回 0，避免 NaN 污染报告。
+pub fn evaluate_similarity_threshold(
+    samples: &[LabeledSimilaritySample],
+    maximum_primary_distance: u32,
+    minimum_secondary_similarity: f32,
+) -> ThresholdMetrics {
+    let minimum_secondary_similarity = minimum_secondary_similarity.clamp(0.0, 1.0);
+    let mut true_positives = 0;
+    let mut false_positives = 0;
+    let mut true_negatives = 0;
+    let mut false_negatives = 0;
+    for sample in samples {
+        let predicted = sample.primary_distance <= maximum_primary_distance
+            && sample.secondary_similarity >= minimum_secondary_similarity;
+        match (predicted, sample.is_match) {
+            (true, true) => true_positives += 1,
+            (true, false) => false_positives += 1,
+            (false, false) => true_negatives += 1,
+            (false, true) => false_negatives += 1,
+        }
+    }
+    let precision = safe_ratio(true_positives, true_positives + false_positives);
+    let recall = safe_ratio(true_positives, true_positives + false_negatives);
+    let f1 = if precision + recall > 0.0 {
+        2.0 * precision * recall / (precision + recall)
+    } else {
+        0.0
+    };
+    ThresholdMetrics {
+        maximum_primary_distance,
+        minimum_secondary_similarity,
+        true_positives,
+        false_positives,
+        true_negatives,
+        false_negatives,
+        precision,
+        recall,
+        f1,
+    }
+}
+
+/// 在调用方给出的候选网格上选择 F1 最优门限；并列时优先更高 precision，
+/// 再优先更严格的主距离和二次相似度，避免无依据地扩大候选范围。
+pub fn select_similarity_threshold(
+    samples: &[LabeledSimilaritySample],
+    primary_distances: &[u32],
+    secondary_similarities: &[f32],
+) -> Option<ThresholdMetrics> {
+    primary_distances
+        .iter()
+        .flat_map(|&primary| {
+            secondary_similarities
+                .iter()
+                .map(move |&secondary| evaluate_similarity_threshold(samples, primary, secondary))
+        })
+        .max_by(|left, right| {
+            left.f1
+                .total_cmp(&right.f1)
+                .then(left.precision.total_cmp(&right.precision))
+                .then(
+                    right
+                        .maximum_primary_distance
+                        .cmp(&left.maximum_primary_distance),
+                )
+                .then(
+                    left.minimum_secondary_similarity
+                        .total_cmp(&right.minimum_secondary_similarity),
+                )
+        })
+}
+
+fn safe_ratio(numerator: usize, denominator: usize) -> f32 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f32 / denominator as f32
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -508,7 +669,24 @@ fn sort_ranked_scores(scores: HashMap<String, f32>) -> Vec<RankedScore> {
     ranked
 }
 
-/// 用 9 个分段倒排桶生成候选，可完整召回汉明距离不超过 8 的 64 位 SimHash/dHash 对。
+fn hamming_masks(width: usize, radius: usize) -> Vec<u64> {
+    let mut masks = vec![0_u64];
+    if radius >= 1 {
+        masks.extend((0..width).map(|bit| 1_u64 << bit));
+    }
+    if radius >= 2 {
+        for left in 0..width {
+            for right in left + 1..width {
+                masks.push((1_u64 << left) | (1_u64 << right));
+            }
+        }
+    }
+    masks
+}
+
+/// 使用三段 Multi-Index Hashing 生成候选。半径不超过 8 时，三个分段中至少
+/// 一个分段的距离不超过 2，因此枚举每段 0..=2 位邻域可完整召回，再以完整
+/// 64 位汉明距离做最终过滤。
 pub fn find_similarity_candidates(
     inputs: &[SimilarityHashInput],
     maximum_distance: u32,
@@ -516,22 +694,24 @@ pub fn find_similarity_candidates(
     if maximum_distance > 8 {
         return Err(AnalysisError::InvalidSimilarityDistance(maximum_distance));
     }
+    let segments = [(0_usize, 21_usize), (21, 21), (42, 22)];
+    let masks = [
+        hamming_masks(21, 2),
+        hamming_masks(21, 2),
+        hamming_masks(22, 2),
+    ];
     let mut buckets = HashMap::<(usize, u64), Vec<usize>>::new();
     let mut candidate_pairs = HashSet::<(usize, usize)>::new();
-    let mut bit_offset = 0_usize;
-    for band in 0..9 {
-        let width = if band == 8 { 8 } else { 7 };
-        let mask = (1_u64 << width) - 1;
-        for (index, input) in inputs.iter().enumerate() {
-            let key = (band, (input.hash >> bit_offset) & mask);
-            if let Some(matches) = buckets.get(&key) {
-                for &other in matches {
-                    candidate_pairs.insert((other.min(index), other.max(index)));
+    for (index, input) in inputs.iter().enumerate() {
+        for (segment, &(offset, width)) in segments.iter().enumerate() {
+            let value = (input.hash >> offset) & ((1_u64 << width) - 1);
+            for &neighbor_mask in &masks[segment] {
+                if let Some(matches) = buckets.get(&(segment, value ^ neighbor_mask)) {
+                    candidate_pairs.extend(matches.iter().map(|&other| (other, index)));
                 }
             }
-            buckets.entry(key).or_default().push(index);
+            buckets.entry((segment, value)).or_default().push(index);
         }
-        bit_offset += width;
     }
     let mut candidates = candidate_pairs
         .into_iter()
@@ -572,6 +752,11 @@ pub fn image_dhash(samples: &[u8; 72]) -> u64 {
 /// dHash 有意保留镜像、旋转差异；调用方可据此给出可解释的近似候选，
 /// 但不得将它当作文件相同或可安全删除的依据。
 pub fn image_dhash_from_path(path: &Path) -> Result<u64, AnalysisError> {
+    Ok(image_hashes_from_path(path)?.0)
+}
+
+/// 一次解码同时生成 dHash 与 DCT pHash，供候选召回和二次验证分别使用。
+pub fn image_hashes_from_path(path: &Path) -> Result<(u64, u64), AnalysisError> {
     let mut reader = ImageReader::open(path)?.with_guessed_format()?;
     let mut limits = Limits::default();
     limits.max_image_width = Some(32_768);
@@ -585,7 +770,46 @@ pub fn image_dhash_from_path(path: &Path) -> Result<u64, AnalysisError> {
     let grayscale = image.resize_exact(9, 8, FilterType::Triangle).to_luma8();
     let mut samples = [0_u8; 72];
     samples.copy_from_slice(grayscale.as_raw());
-    Ok(image_dhash(&samples))
+    Ok((image_dhash(&samples), image_phash(&image)))
+}
+
+/// 32×32 灰度 DCT 的低频 8×8 pHash；DC 分量不参与阈值计算。
+pub fn image_phash(image: &DynamicImage) -> u64 {
+    const SOURCE: usize = 32;
+    const LOW: usize = 8;
+    let pixels = image
+        .resize_exact(SOURCE as u32, SOURCE as u32, FilterType::Triangle)
+        .to_luma8();
+    let cosines = std::array::from_fn::<_, LOW, _>(|frequency| {
+        std::array::from_fn::<_, SOURCE, _>(|coordinate| {
+            ((std::f64::consts::PI / SOURCE as f64) * (coordinate as f64 + 0.5) * frequency as f64)
+                .cos()
+        })
+    });
+    let mut coefficients = [0_f64; LOW * LOW];
+    for vertical in 0..LOW {
+        for horizontal in 0..LOW {
+            let mut sum = 0_f64;
+            for y in 0..SOURCE {
+                for x in 0..SOURCE {
+                    sum += f64::from(pixels.get_pixel(x as u32, y as u32)[0])
+                        * cosines[horizontal][x]
+                        * cosines[vertical][y];
+                }
+            }
+            coefficients[vertical * LOW + horizontal] = sum;
+        }
+    }
+    let mut threshold_values = coefficients[1..].to_vec();
+    threshold_values.sort_by(f64::total_cmp);
+    let median = threshold_values[threshold_values.len() / 2];
+    coefficients
+        .iter()
+        .enumerate()
+        .skip(1)
+        .fold(0_u64, |hash, (index, value)| {
+            hash | (u64::from(*value > median) << index)
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -876,6 +1100,17 @@ mod tests {
     }
 
     #[test]
+    fn minhash_secondary_verification_distinguishes_related_text() {
+        let original =
+            text_minhash("项目计划包含预算、时间表、交付标准和风险说明").expect("original");
+        let edited =
+            text_minhash("项目计划包含预算、时间安排、交付标准以及风险说明").expect("edited");
+        let unrelated = text_minhash("周末天气晴朗，适合徒步和拍摄城市风景").expect("unrelated");
+        assert!(minhash_similarity(&original, &edited) > minhash_similarity(&original, &unrelated));
+        assert_eq!(minhash_similarity(&original, &original), 1.0);
+    }
+
+    #[test]
     fn similarity_candidate_index_recalls_close_hashes_without_all_pairs() {
         let candidates = find_similarity_candidates(
             &[
@@ -907,6 +1142,106 @@ mod tests {
             find_similarity_candidates(&[], 9),
             Err(AnalysisError::InvalidSimilarityDistance(9))
         ));
+    }
+
+    #[test]
+    fn similarity_multi_index_matches_exhaustive_hamming_search() {
+        let inputs = (0..512_u64)
+            .map(|index| SimilarityHashInput {
+                id: format!("item-{index:04}"),
+                hash: {
+                    let mut value = index.wrapping_add(0x9e3779b97f4a7c15);
+                    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+                    value ^ (value >> 31)
+                },
+            })
+            .collect::<Vec<_>>();
+        let actual = find_similarity_candidates(&inputs, 8).expect("valid radius");
+        let expected = inputs
+            .iter()
+            .enumerate()
+            .flat_map(|(left, left_input)| {
+                inputs
+                    .iter()
+                    .enumerate()
+                    .skip(left + 1)
+                    .filter_map(move |(_, right_input)| {
+                        let distance = (left_input.hash ^ right_input.hash).count_ones();
+                        (distance <= 8).then_some((
+                            left_input.id.clone(),
+                            right_input.id.clone(),
+                            distance,
+                        ))
+                    })
+            })
+            .collect::<HashSet<_>>();
+        let actual = actual
+            .into_iter()
+            .map(|candidate| {
+                (
+                    candidate.left_id,
+                    candidate.right_id,
+                    candidate.hamming_distance,
+                )
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn threshold_evaluation_reports_confusion_matrix_and_metrics() {
+        let samples = [
+            LabeledSimilaritySample {
+                primary_distance: 2,
+                secondary_similarity: 0.91,
+                is_match: true,
+            },
+            LabeledSimilaritySample {
+                primary_distance: 7,
+                secondary_similarity: 0.74,
+                is_match: true,
+            },
+            LabeledSimilaritySample {
+                primary_distance: 4,
+                secondary_similarity: 0.20,
+                is_match: false,
+            },
+            LabeledSimilaritySample {
+                primary_distance: 10,
+                secondary_similarity: 0.88,
+                is_match: false,
+            },
+        ];
+        let metrics = evaluate_similarity_threshold(&samples, 8, 0.50);
+        assert_eq!(metrics.true_positives, 2);
+        assert_eq!(metrics.false_positives, 0);
+        assert_eq!(metrics.true_negatives, 2);
+        assert_eq!(metrics.false_negatives, 0);
+        assert_eq!(metrics.precision, 1.0);
+        assert_eq!(metrics.recall, 1.0);
+        assert_eq!(metrics.f1, 1.0);
+    }
+
+    #[test]
+    fn threshold_selection_prefers_stricter_equal_quality_gate() {
+        let samples = [
+            LabeledSimilaritySample {
+                primary_distance: 3,
+                secondary_similarity: 0.80,
+                is_match: true,
+            },
+            LabeledSimilaritySample {
+                primary_distance: 9,
+                secondary_similarity: 0.95,
+                is_match: false,
+            },
+        ];
+        let selected = select_similarity_threshold(&samples, &[8, 6, 4], &[0.25, 0.50])
+            .expect("non-empty threshold grid");
+        assert_eq!(selected.maximum_primary_distance, 4);
+        assert_eq!(selected.minimum_secondary_similarity, 0.50);
+        assert_eq!(selected.f1, 1.0);
     }
 
     #[test]
@@ -990,6 +1325,30 @@ mod tests {
         image.save(&path)?;
 
         assert_eq!(image_dhash_from_path(&path)?, u64::MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn image_phash_survives_resize_and_jpeg_encoding() -> Result<(), Box<dyn std::error::Error>> {
+        use image::codecs::jpeg::JpegEncoder;
+
+        let source = image::RgbImage::from_fn(160, 120, |x, y| {
+            let block = if (x / 24 + y / 20) % 2 == 0 { 220 } else { 35 };
+            image::Rgb([block, ((x + y) % 255) as u8, 255 - block])
+        });
+        let resized = image::imageops::resize(&source, 96, 72, FilterType::Lanczos3);
+        let directory = tempfile::tempdir()?;
+        let png = directory.path().join("source.png");
+        let jpeg = directory.path().join("resized.jpg");
+        source.save(&png)?;
+        let mut bytes = Vec::new();
+        JpegEncoder::new_with_quality(&mut bytes, 82)
+            .encode_image(&DynamicImage::ImageRgb8(resized))?;
+        std::fs::write(&jpeg, bytes)?;
+
+        let (_, original_phash) = image_hashes_from_path(&png)?;
+        let (_, transformed_phash) = image_hashes_from_path(&jpeg)?;
+        assert!((original_phash ^ transformed_phash).count_ones() <= 10);
         Ok(())
     }
 

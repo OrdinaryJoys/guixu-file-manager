@@ -8,9 +8,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use guixu_analysis::{
     DuplicateInput, DuplicateProgress, EXACT_HASH_ALGORITHM, FileCategory, RetentionInput,
-    SimilarityHashInput, classify_file, find_exact_duplicates_cached_controlled,
-    find_similarity_candidates, image_dhash_from_path, rank_duplicate_retention, text_simhash,
-    unique_filename,
+    SimilarityHashInput, TEXT_MINHASH_COMPONENTS, classify_file,
+    find_exact_duplicates_cached_controlled, find_similarity_candidates, image_hashes_from_path,
+    minhash_similarity, rank_duplicate_retention, text_minhash, text_simhash, unique_filename,
 };
 use guixu_domain::{ConflictPolicy, FileOperationKind, FileSnapshot, JobStatus, RuntimeInfo};
 use guixu_indexer::{PlatformWatcher, ReconcileRequest, ScanOptions, reconcile_snapshot};
@@ -278,7 +278,10 @@ struct SimilarContentPairView {
     right_file_id: String,
     right_path: String,
     hamming_distance: u32,
+    secondary_distance: Option<u32>,
+    secondary_similarity: f32,
     similarity: f32,
+    verification: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +292,11 @@ struct SimilarContentReportView {
     computed_features: usize,
     cache_hits: usize,
     skipped_files: usize,
+    candidate_pairs: usize,
+    secondary_verified_pairs: usize,
+    feature_ms: u64,
+    candidate_ms: u64,
+    algorithm_profile: String,
     pairs: Vec<SimilarContentPairView>,
 }
 
@@ -1325,13 +1333,44 @@ fn operation_history(
 }
 
 const TEXT_SIMHASH_VERSION: &str = "text-simhash-char3-v1";
+const TEXT_MINHASH_VERSION: &str = "text-minhash-char5x32-v1";
 const IMAGE_DHASH_VERSION: &str = "image-dhash-gray9x8-v1";
+const IMAGE_PHASH_VERSION: &str = "image-phash-dct32x32-low8-v1";
+
+fn u64_feature(feature: Option<FileFeature>) -> Option<u64> {
+    let bytes = feature?.feature_blob;
+    (bytes.len() == 8)
+        .then(|| u64::from_le_bytes(bytes.as_slice().try_into().expect("validated eight bytes")))
+}
+
+fn minhash_feature(feature: Option<FileFeature>) -> Option<[u64; TEXT_MINHASH_COMPONENTS]> {
+    let bytes = feature?.feature_blob;
+    if bytes.len() != TEXT_MINHASH_COMPONENTS * 8 {
+        return None;
+    }
+    Some(std::array::from_fn(|index| {
+        let offset = index * 8;
+        u64::from_le_bytes(
+            bytes[offset..offset + 8]
+                .try_into()
+                .expect("eight-byte component"),
+        )
+    }))
+}
+
+fn minhash_blob(signature: &[u64; TEXT_MINHASH_COMPONENTS]) -> Vec<u8> {
+    signature
+        .iter()
+        .flat_map(|component| component.to_le_bytes())
+        .collect()
+}
 
 fn compute_similar_texts(
     app: &AppHandle,
     library_id: &str,
     mut should_continue: impl FnMut(u64, u64) -> bool,
 ) -> Result<(SimilarContentReportView, bool), String> {
+    let feature_started = Instant::now();
     let database = open_worker_database(app)?;
     let library = database
         .library_root(library_id)
@@ -1343,6 +1382,7 @@ fn compute_similar_texts(
     let mut cursor = None;
     let mut files = HashMap::<String, IndexedFile>::new();
     let mut hashes = Vec::new();
+    let mut minhashes = HashMap::<String, [u64; TEXT_MINHASH_COMPONENTS]>::new();
     let mut computed_features = 0_usize;
     let mut cache_hits = 0_usize;
     let mut skipped_files = 0_usize;
@@ -1396,22 +1436,20 @@ fn compute_similar_texts(
                     continue;
                 }
             };
-            let hash = if let Some(feature) = database
-                .file_feature(&file, "text_simhash", TEXT_SIMHASH_VERSION)
-                .map_err(display_error)?
+            let cached_hash = u64_feature(
+                database
+                    .file_feature(&file, "text_simhash", TEXT_SIMHASH_VERSION)
+                    .map_err(display_error)?,
+            );
+            let cached_minhash = minhash_feature(
+                database
+                    .file_feature(&file, "text_minhash", TEXT_MINHASH_VERSION)
+                    .map_err(display_error)?,
+            );
+            let (hash, minhash) = if let (Some(hash), Some(minhash)) = (cached_hash, cached_minhash)
             {
-                if feature.feature_blob.len() != 8 {
-                    skipped_files += 1;
-                    continue;
-                }
                 cache_hits += 1;
-                u64::from_le_bytes(
-                    feature
-                        .feature_blob
-                        .as_slice()
-                        .try_into()
-                        .expect("eight bytes"),
-                )
+                (hash, minhash)
             } else {
                 const MAX_TEXT_BYTES: u64 = 512 * 1024;
                 let mut bytes = Vec::new();
@@ -1437,6 +1475,10 @@ fn compute_similar_texts(
                     skipped_files += 1;
                     continue;
                 };
+                let Some(minhash) = text_minhash(&text) else {
+                    skipped_files += 1;
+                    continue;
+                };
                 database
                     .save_file_feature(&FileFeature {
                         file_id: file.id.clone(),
@@ -1451,34 +1493,64 @@ fn compute_similar_texts(
                         created_at_ms: now_ms(),
                     })
                     .map_err(display_error)?;
+                database
+                    .save_file_feature(&FileFeature {
+                        file_id: file.id.clone(),
+                        feature_kind: "text_minhash".to_owned(),
+                        model_version: TEXT_MINHASH_VERSION.to_owned(),
+                        size: file.size,
+                        modified_at_ns: file.modified_at_ns,
+                        changed_at_ns: file.changed_at_ns,
+                        dimensions: TEXT_MINHASH_COMPONENTS as u32,
+                        quantization: "u64x32".to_owned(),
+                        feature_blob: minhash_blob(&minhash),
+                        created_at_ms: now_ms(),
+                    })
+                    .map_err(display_error)?;
                 computed_features += 1;
-                hash
+                (hash, minhash)
             };
             hashes.push(SimilarityHashInput {
                 id: file.id.clone(),
                 hash,
             });
+            minhashes.insert(file.id.clone(), minhash);
             files.insert(file.id.clone(), file);
         }
         let Some(next) = page.next_cursor else { break };
         cursor = Some(next);
     }
-    let pairs = find_similarity_candidates(&hashes, 8)
-        .map_err(display_error)?
+    let feature_ms = feature_started.elapsed().as_millis() as u64;
+    let candidate_started = Instant::now();
+    let candidates = find_similarity_candidates(&hashes, 8).map_err(display_error)?;
+    let candidate_pairs = candidates.len();
+    let pairs = candidates
         .into_iter()
         .filter_map(|candidate| {
             let left = files.get(&candidate.left_id)?;
             let right = files.get(&candidate.right_id)?;
+            let minhash_similarity = minhash_similarity(
+                minhashes.get(&candidate.left_id)?,
+                minhashes.get(&candidate.right_id)?,
+            );
+            if minhash_similarity < 0.25 {
+                return None;
+            }
             Some(SimilarContentPairView {
                 left_file_id: left.id.clone(),
                 left_path: left.current_path.clone(),
                 right_file_id: right.id.clone(),
                 right_path: right.current_path.clone(),
                 hamming_distance: candidate.hamming_distance,
-                similarity: candidate.similarity,
+                secondary_distance: None,
+                secondary_similarity: minhash_similarity,
+                similarity: candidate.similarity * 0.45 + minhash_similarity * 0.55,
+                verification: "SimHash 候选 + MinHash 字符五元组复核".to_owned(),
             })
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let candidate_ms = candidate_started.elapsed().as_millis() as u64;
+    let secondary_verified_pairs = pairs.len();
     Ok((
         SimilarContentReportView {
             content_kind: "text".to_owned(),
@@ -1486,6 +1558,11 @@ fn compute_similar_texts(
             computed_features,
             cache_hits,
             skipped_files,
+            candidate_pairs,
+            secondary_verified_pairs,
+            feature_ms,
+            candidate_ms,
+            algorithm_profile: "simhash64-mih3-r8+minhash32-v1".to_owned(),
             pairs,
         },
         interrupted,
@@ -1497,6 +1574,7 @@ fn compute_similar_images(
     library_id: &str,
     mut should_continue: impl FnMut(u64, u64) -> bool,
 ) -> Result<(SimilarContentReportView, bool), String> {
+    let feature_started = Instant::now();
     let database = open_worker_database(app)?;
     let library = database
         .library_root(library_id)
@@ -1508,6 +1586,7 @@ fn compute_similar_images(
     let mut cursor = None;
     let mut files = HashMap::<String, IndexedFile>::new();
     let mut hashes = Vec::new();
+    let mut phashes = HashMap::<String, u64>::new();
     let mut computed_features = 0_usize;
     let mut cache_hits = 0_usize;
     let mut skipped_files = 0_usize;
@@ -1543,25 +1622,22 @@ fn compute_similar_images(
                     continue;
                 }
             };
-            let hash = if let Some(feature) = database
-                .file_feature(&file, "image_dhash", IMAGE_DHASH_VERSION)
-                .map_err(display_error)?
-            {
-                if feature.feature_blob.len() != 8 {
-                    skipped_files += 1;
-                    continue;
-                }
+            let cached_dhash = u64_feature(
+                database
+                    .file_feature(&file, "image_dhash", IMAGE_DHASH_VERSION)
+                    .map_err(display_error)?,
+            );
+            let cached_phash = u64_feature(
+                database
+                    .file_feature(&file, "image_phash", IMAGE_PHASH_VERSION)
+                    .map_err(display_error)?,
+            );
+            let (hash, phash) = if let (Some(hash), Some(phash)) = (cached_dhash, cached_phash) {
                 cache_hits += 1;
-                u64::from_le_bytes(
-                    feature
-                        .feature_blob
-                        .as_slice()
-                        .try_into()
-                        .expect("eight bytes"),
-                )
+                (hash, phash)
             } else {
-                let hash = match image_dhash_from_path(&canonical) {
-                    Ok(hash) => hash,
+                let (hash, phash) = match image_hashes_from_path(&canonical) {
+                    Ok(hashes) => hashes,
                     Err(_) => {
                         skipped_files += 1;
                         continue;
@@ -1581,34 +1657,63 @@ fn compute_similar_images(
                         created_at_ms: now_ms(),
                     })
                     .map_err(display_error)?;
+                database
+                    .save_file_feature(&FileFeature {
+                        file_id: file.id.clone(),
+                        feature_kind: "image_phash".to_owned(),
+                        model_version: IMAGE_PHASH_VERSION.to_owned(),
+                        size: file.size,
+                        modified_at_ns: file.modified_at_ns,
+                        changed_at_ns: file.changed_at_ns,
+                        dimensions: 64,
+                        quantization: "binary64".to_owned(),
+                        feature_blob: phash.to_le_bytes().to_vec(),
+                        created_at_ms: now_ms(),
+                    })
+                    .map_err(display_error)?;
                 computed_features += 1;
-                hash
+                (hash, phash)
             };
             hashes.push(SimilarityHashInput {
                 id: file.id.clone(),
                 hash,
             });
+            phashes.insert(file.id.clone(), phash);
             files.insert(file.id.clone(), file);
         }
         let Some(next) = page.next_cursor else { break };
         cursor = Some(next);
     }
-    let pairs = find_similarity_candidates(&hashes, 8)
-        .map_err(display_error)?
+    let feature_ms = feature_started.elapsed().as_millis() as u64;
+    let candidate_started = Instant::now();
+    let candidates = find_similarity_candidates(&hashes, 8).map_err(display_error)?;
+    let candidate_pairs = candidates.len();
+    let pairs = candidates
         .into_iter()
         .filter_map(|candidate| {
             let left = files.get(&candidate.left_id)?;
             let right = files.get(&candidate.right_id)?;
+            let phash_distance =
+                (phashes.get(&candidate.left_id)? ^ phashes.get(&candidate.right_id)?).count_ones();
+            if phash_distance > 12 {
+                return None;
+            }
+            let phash_similarity = 1.0 - phash_distance as f32 / 64.0;
             Some(SimilarContentPairView {
                 left_file_id: left.id.clone(),
                 left_path: left.current_path.clone(),
                 right_file_id: right.id.clone(),
                 right_path: right.current_path.clone(),
                 hamming_distance: candidate.hamming_distance,
-                similarity: candidate.similarity,
+                secondary_distance: Some(phash_distance),
+                secondary_similarity: phash_similarity,
+                similarity: candidate.similarity * 0.4 + phash_similarity * 0.6,
+                verification: "dHash 候选 + DCT pHash 复核".to_owned(),
             })
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let candidate_ms = candidate_started.elapsed().as_millis() as u64;
+    let secondary_verified_pairs = pairs.len();
     Ok((
         SimilarContentReportView {
             content_kind: "image".to_owned(),
@@ -1616,6 +1721,11 @@ fn compute_similar_images(
             computed_features,
             cache_hits,
             skipped_files,
+            candidate_pairs,
+            secondary_verified_pairs,
+            feature_ms,
+            candidate_ms,
+            algorithm_profile: "dhash64-mih3-r8+phash64-r12-v1".to_owned(),
             pairs,
         },
         interrupted,
@@ -2555,8 +2665,11 @@ fn finish_job(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
+    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    #[cfg(feature = "e2e")]
+    let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
+
+    builder
         .setup(|app| {
             let data_directory = std::env::var_os("GUIXU_DATA_DIR")
                 .map(PathBuf::from)

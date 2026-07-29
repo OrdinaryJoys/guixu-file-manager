@@ -45,7 +45,7 @@
 | M5 算法生产化 | 进行中 | M5.1–M5.3 完成；M5.4 文本/图片基础 provider、EXIF 方向归一化、持久任务与 Web/App 统一候选 UI 完成，阈值基准和增强 provider 待实现 | 基准集、准确率、性能、内存和取消测试 |
 | M6 平台增强与发布 | 待实现 | Quick Look、Spotlight/PDF/Vision、Windows provider、安装发布 | 真机矩阵、签名/权限、升级/降级和安装包验收 |
 
-截至本文检查时，Rust workspace 共 **81 项测试通过、0 项失败**。这证明现有核心路径满足当前测试约束，不等同于 M5–M6 已完成。
+截至本文检查时，Rust workspace 共 **87 项测试通过、0 项失败**。这证明现有核心路径满足当前测试约束，不等同于 M5–M6 已完成。
 
 ## 4. 总体架构
 
@@ -299,4 +299,4 @@ git diff --check
 
 ## 13. 下一次实施检查点
 
-M5.3 已完成。M5.4 已完成文本 SimHash、受限图片解码、EXIF 方向归一化与 dHash、快照缓存、LSH 候选、持久任务和 Web/App 同步只读界面；下一步建立真实阈值基准，并补充 pHash/MinHash 与 Vision 增强 provider。完成准确率评估前不开放批量清理。
+M5.3 已完成。M5.4 已完成文本 SimHash + MinHash、受限图片解码、EXIF 方向归一化 dHash + DCT pHash、快照缓存、精确 MIH 候选、持久任务和 Web/App 同步只读界面；阈值评估器与 10k/100k 合成性能基线也已建立。下一步采集真实标注集并校准门限，再接入 Vision 增强 provider。完成准确率评估前不开放批量清理。

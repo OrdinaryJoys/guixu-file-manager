@@ -16,7 +16,7 @@
 | M2 文件浏览交互 | 完成 | 列表/网格、排序、多选、键盘导航、预览、打开和显示 |
 | M3 搜索与智能文件夹 | 完成 | Unicode/Trigram 搜索、结构化条件、智能文件夹持久化 |
 | M4 通用文件操作 | 完成 | 批量重命名、安全复制、通用移动与受控隔离区删除均已形成可恢复闭环 |
-| M5 算法生产化 | 进行中 | M5.1–M5.3 完成；M5.4 文本 SimHash、图片 EXIF 方向归一化 dHash、特征缓存、持久任务及 Web/App 统一候选 UI 完成，真实阈值基准待推进 |
+| M5 算法生产化 | 进行中 | M5.1–M5.3 完成；M5.4 已形成 SimHash/MinHash 与 dHash/pHash 双阶段链路、精确 MIH 候选、阈值评估器和性能基线，真实标注集校准待推进 |
 | M6 平台增强与发布 | 待开始 | Quick Look、Spotlight/Vision、Windows provider、安装发布 |
 
 ## 当前可用能力
@@ -34,10 +34,10 @@
 - 重复文件按修改时间、路径层级、副本名称和隐藏目录输出确定性保留分与解释；用户必须逐项选择清理对象，且每组至少保留一项；
 - 重复清理复用 M4 受控废纸篓的计划预览、预检、执行、历史和撤销链路，不开放永久删除；
 - 精确重复分析已进入持久后台队列，展示真实进度并支持暂停、恢复和取消；中断时保留已计算哈希，完成报告跨重启持久化；
-- 相似文本 SimHash 与相似图片 dHash 共用 9 段倒排候选索引，可完整召回汉明距离不超过 8 的候选并避免直接全量两两比较；
+- 相似文本 SimHash 与相似图片 dHash 共用三段 Multi-Index Hashing 候选索引；每段枚举 0–2 位邻域，可完整召回汉明距离不超过 8 的候选，再分别以 32 分量字符五元组 MinHash 和 DCT pHash 复核；
 - 混合检索融合基础已实现：无标注时使用确定性 RRF，有本地校准样本时使用归一化凸组合，禁止直接混加 BM25 与余弦原始分数；
 - schema 11 已持久化快照/模型版本绑定的文件特征、相似运行与候选边；相似文本和图片在 Web 演示与 Tauri App 使用同一报告契约、只读卡片 UI 和任务中心；
-- 图片基础 provider 支持 JPG/JPEG/PNG/WebP，采用有尺寸与内存上限的解码、9×8 灰度归一化和 64 位 dHash；文本/图片分析均可暂停、恢复、取消，完成报告跨重启持久化；
+- 图片基础 provider 支持 JPG/JPEG/PNG/WebP，采用有尺寸与内存上限的一次解码，同时生成 64 位 dHash 与低频 DCT pHash；文本/图片分析均可暂停、恢复、取消，完成报告跨重启持久化；
 - 选择式整理计划、执行前预检、持久操作日志、执行、历史和撤销；
 - 只读精确重复分析，不提供永久删除入口；
 - 基础魔数/容器分类、SimHash、dHash 和安全命名算法测试。
@@ -49,9 +49,9 @@
 
 - **2026-07-29 全库审计与首轮修复已完成**：原始审计记录 68 项（高 8 / 中 21 / 低 39）；P0 数据安全、P1 核心任务生命周期、P2 关键锁竞争、P3 前端竞态均已落地并补测试，P4/P5 的平台增强与低危边界继续按 [REMEDIATION_PLAN](./REMEDIATION_PLAN.md) 跟踪；
 - 受控隔离区当前不自动永久清空，保留策略是持续保留并由历史记录恢复；永久清理入口待独立安全评审；
-- 相似文本/图片基础 provider 已接入产品并处理 EXIF 方向，尚未完成真实数据集阈值评估、pHash/MinHash 二次验证及平台增强 provider；
+- 相似文本/图片基础 provider 已接入产品并处理 EXIF 方向，pHash/MinHash 二次验证及阈值评估代码已完成；尚缺真实标注数据集的 precision/recall 校准和平台增强 provider；
 - 精确重复评分仍需真实基准集校准；相似内容在评估完成前保持只读，不开放清理；
-- 真实外置卷上的首次图片特征任务曾出现异常长等待，已确认最终结果与缓存正确；下一阶段需增加解码、数据库写入和任务调度分段耗时，建立冷启动 p95 门槛；
+- 真实外置卷上的首次图片特征任务曾出现异常长等待，已确认最终结果与缓存正确；当前报告已区分特征阶段与候选阶段耗时，下一阶段继续拆分解码、数据库写入和任务调度并建立冷启动 p95 门槛；
 - Quick Look、Spotlight、PDFKit/Vision 和 Windows 平台 provider 尚未接入；
 - 正式签名、公证、安装器，以及真实“打开文件/在访达显示”的发布流程仍需真机验收；
 
@@ -59,13 +59,16 @@
 
 截至状态日期（以最新一次全量命令输出为准）：
 
-- Rust workspace：81 项测试通过，0 项失败；
+- Rust workspace：87 项测试通过，0 项失败；
 - `cargo fmt --all --check`：通过；
 - 严格 Clippy：通过；
 - `node --check apps/desktop/web/app.js`：通过；
 - `node tools/verify_frontend_contract.mjs`：通过；
+- `cargo bench -p guixu-analysis --bench similarity`：10k 为 98.024 ms 中位估计，100k 为 1.3207 s 中位估计（macOS 15.7.7 / arm64，确定性合成哈希）；
+- `cd e2e && npm test`：macOS 嵌入式 WebDriver 原生 App 2 项通过，覆盖核心连接、安全初始态、设置分区、即时样式与持久化；
 - `git diff --check`：通过；
 - Web 与 Tauri App 共用同一套 `apps/desktop/web` 前端资源和命令契约，搜索、智能文件夹、设置、预览、相似内容和任务状态未维护第二份实现；
+- GitHub Actions `Quality gates` 在 macOS 上持续执行 Rust、前端契约、生产依赖审计与原生 Tauri E2E；
 - Tauri 官方 debug `.app` 已在 macOS 15.7.7 / Apple Silicon 真实运行：核心连接、真实索引、设置四分区、搜索、智能文件夹、文件预览、相似文本/图片和任务结果回填通过；真实拖拽到 900×620 最小尺寸验证无横向溢出，侧栏标签保持单行，窄窗口隐藏预览和修改时间列并保留最新两项任务。
 
 ```bash
@@ -74,12 +77,14 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 node --check apps/desktop/web/app.js
 node tools/verify_frontend_contract.mjs
+cargo bench -p guixu-analysis --bench similarity
+cd e2e && npm test
 ```
 
 模块级代码、算法、Web 和原生窗口证据以及仍未通过的发布门，统一记录在 [交叉验证矩阵](./CROSS_VALIDATION_2026.md)。
 
 ## 下一开发检查点
 
-M4.1–M4.5、M5.1–M5.3 已完成；M5.4 已交付相似文本与图片跨平台基础及 EXIF 方向归一化。下一增量建立真实阈值数据集，补充 pHash/MinHash 二次验证，再接入 macOS Vision provider；完成准确率验收前不开放批量清理。
+M4.1–M4.5、M5.1–M5.3 已完成；M5.4 已交付相似文本/图片双阶段复核、EXIF 方向归一化、MIH 候选、阈值评估器和可复现性能基线。下一增量建立真实标注集并校准阈值，再接入 macOS Vision provider；完成准确率验收前不开放批量清理。
 
 每完成一个增量，依次执行：单元测试 → 临时目录集成测试 → 页面交互验证 → 更新本文和主方案状态。

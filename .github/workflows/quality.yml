@@ -1,0 +1,46 @@
+name: Quality gates
+
+on:
+  push:
+    branches: [main, "codex/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-quality:
+    runs-on: macos-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Rust tests
+        run: cargo test --workspace
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Strict Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Frontend contracts
+        run: |
+          node --check apps/desktop/web/app.js
+          node tools/verify_frontend_contract.mjs
+      - name: Install native E2E dependencies
+        working-directory: e2e
+        run: npm ci
+      - name: Production dependency audit
+        working-directory: e2e
+        run: npm audit --omit=dev
+      - name: Native Tauri E2E
+        working-directory: e2e
+        run: npm test

@@ -512,6 +512,17 @@ pub fn execute_stored_plan(
     operation_id: &str,
     now_ms: i64,
 ) -> Result<ExecutionReport, WorkflowError> {
+    execute_stored_plan_with_hook(database, root, plan_id, operation_id, now_ms, |_, _| Ok(()))
+}
+
+fn execute_stored_plan_with_hook(
+    database: &mut Database,
+    root: &Path,
+    plan_id: &str,
+    operation_id: &str,
+    now_ms: i64,
+    mut before_item: impl FnMut(i64, &MoveIntent) -> Result<(), MoveError>,
+) -> Result<ExecutionReport, WorkflowError> {
     let plan = database.plan(plan_id)?.ok_or(WorkflowError::PlanNotFound)?;
     if plan.status != "ready" {
         return Err(WorkflowError::PlanNotReady(plan.status));
@@ -570,6 +581,7 @@ pub fn execute_stored_plan(
     let mut completed = 0;
     for (item, intent) in plan.items.iter().zip(&intents) {
         let result = (|| -> Result<MoveOutcome, MoveError> {
+            before_item(item.ordinal, intent)?;
             let parent = intent.target.parent().ok_or_else(|| {
                 MoveError::Io(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -2026,6 +2038,101 @@ mod tests {
         undo_stored_operation(&mut database, &root, "operation", 30).expect("undo rename");
         assert!(source.exists());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn injected_mid_batch_conflict_enters_recovery_without_touching_later_source() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        let sources = [root.join("first.txt"), root.join("second.txt")];
+        fs::write(&sources[0], b"first payload").expect("first source");
+        fs::write(&sources[1], b"second payload").expect("second source");
+        let targets = [
+            root.join("sorted/first.txt"),
+            root.join("sorted/second.txt"),
+        ];
+        let observed = sources
+            .iter()
+            .map(|source| observe_file(source).expect("observe source"))
+            .collect::<Vec<_>>();
+        let mut database =
+            Database::open(directory.path().join("fault.sqlite3")).expect("database");
+        database
+            .connection()
+            .execute(
+                "INSERT INTO libraries(id,name,created_at_ms,updated_at_ms) VALUES('library','测试',1,1)",
+                [],
+            )
+            .expect("library fixture");
+        for index in 0..2 {
+            database
+                .reconcile_file(
+                    "library",
+                    &format!("file-{index}"),
+                    sources[index].to_str().expect("source path"),
+                    &observed[index].identity,
+                    &observed[index].snapshot,
+                    5,
+                )
+                .expect("index fixture");
+        }
+        let items = (0..2)
+            .map(|index| NewPlanItem {
+                ordinal: index as i64,
+                file_id: format!("file-{index}"),
+                source_path: sources[index].to_string_lossy().into_owned(),
+                target_path: targets[index].to_string_lossy().into_owned(),
+                expected_identity: observed[index].identity.clone(),
+                expected_snapshot: observed[index].snapshot.clone(),
+            })
+            .collect::<Vec<_>>();
+        database
+            .create_plan(NewPlan {
+                id: "fault-plan",
+                library_id: "library",
+                operation_kind: FileOperationKind::Organize,
+                conflict_policy: ConflictPolicy::Abort,
+                created_at_ms: 10,
+                expires_at_ms: 1_000,
+                items: &items,
+            })
+            .expect("plan fixture");
+
+        let result = execute_stored_plan_with_hook(
+            &mut database,
+            &root,
+            "fault-plan",
+            "fault-operation",
+            20,
+            |ordinal, intent| {
+                if ordinal == 1 {
+                    fs::create_dir_all(intent.target.parent().expect("target parent"))?;
+                    fs::write(&intent.target, b"external file appeared")?;
+                }
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(WorkflowError::ItemFailed { ordinal: 1, .. })
+        ));
+        assert!(targets[0].exists());
+        assert!(!sources[0].exists());
+        assert!(sources[1].exists());
+        assert_eq!(
+            fs::read(&targets[1]).expect("conflict target"),
+            b"external file appeared"
+        );
+        assert_eq!(
+            database
+                .operation("fault-operation")
+                .expect("operation query")
+                .expect("operation")
+                .status,
+            "recovery_needed"
+        );
     }
 
     #[test]
