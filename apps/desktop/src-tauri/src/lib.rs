@@ -2587,6 +2587,42 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+#[cfg(feature = "e2e")]
+fn register_e2e_library(database: &mut Database) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(path) = std::env::var_os("GUIXU_E2E_LIBRARY") else {
+        return Ok(());
+    };
+    let canonical = PathBuf::from(path).canonicalize()?;
+    if !canonical.is_dir() {
+        return Err("GUIXU_E2E_LIBRARY 必须指向现有文件夹".into());
+    }
+    let root_path = canonical
+        .to_str()
+        .ok_or("GUIXU_E2E_LIBRARY 必须是有效 UTF-8 路径")?
+        .to_owned();
+    let timestamp = now_ms();
+    let record = database.register_library_root(
+        &unique_id("e2e-library", timestamp),
+        &unique_id("e2e-root", timestamp),
+        "E2E Fixture",
+        &root_path,
+        timestamp,
+    )?;
+    let payload = serde_json::to_string(&ScanPayload {
+        library_id: record.library_id,
+        root_path: record.root_path,
+    })?;
+    database.enqueue_or_reuse_job(&NewJob {
+        id: unique_id("e2e-scan", timestamp),
+        kind: "library_scan".to_owned(),
+        payload_json: payload,
+        priority: 100,
+        progress_total: None,
+        created_at_ms: timestamp,
+    })?;
+    Ok(())
+}
+
 fn hash_hex(hash: [u8; 32]) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -2680,6 +2716,8 @@ pub fn run() {
                 .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
             audit_incomplete_operations(&mut database, now_ms())
                 .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
+            #[cfg(feature = "e2e")]
+            register_e2e_library(&mut database)?;
             // P5：清扫崩溃残留的 .guixu-*.tmp 临时文件。
             if let Some(root) = database.latest_library_root().ok().flatten() {
                 if let Ok(entries) = std::fs::read_dir(Path::new(&root.root_path)) {

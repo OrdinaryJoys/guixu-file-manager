@@ -2135,6 +2135,102 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn injected_symlinked_target_directory_cannot_escape_authorized_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().join("library");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&root).expect("library root");
+        fs::create_dir_all(&outside).expect("outside root");
+        let sources = [root.join("first.txt"), root.join("second.txt")];
+        fs::write(&sources[0], b"first payload").expect("first source");
+        fs::write(&sources[1], b"second payload").expect("second source");
+        let targets = [
+            root.join("safe/first.txt"),
+            root.join("redirected/second.txt"),
+        ];
+        let observed = sources
+            .iter()
+            .map(|source| observe_file(source).expect("observe source"))
+            .collect::<Vec<_>>();
+        let mut database =
+            Database::open(directory.path().join("symlink-fault.sqlite3")).expect("database");
+        database
+            .connection()
+            .execute(
+                "INSERT INTO libraries(id,name,created_at_ms,updated_at_ms) VALUES('library','测试',1,1)",
+                [],
+            )
+            .expect("library fixture");
+        for index in 0..2 {
+            database
+                .reconcile_file(
+                    "library",
+                    &format!("file-{index}"),
+                    sources[index].to_str().expect("source path"),
+                    &observed[index].identity,
+                    &observed[index].snapshot,
+                    5,
+                )
+                .expect("index fixture");
+        }
+        let items = (0..2)
+            .map(|index| NewPlanItem {
+                ordinal: index as i64,
+                file_id: format!("file-{index}"),
+                source_path: sources[index].to_string_lossy().into_owned(),
+                target_path: targets[index].to_string_lossy().into_owned(),
+                expected_identity: observed[index].identity.clone(),
+                expected_snapshot: observed[index].snapshot.clone(),
+            })
+            .collect::<Vec<_>>();
+        database
+            .create_plan(NewPlan {
+                id: "symlink-fault-plan",
+                library_id: "library",
+                operation_kind: FileOperationKind::Organize,
+                conflict_policy: ConflictPolicy::Abort,
+                created_at_ms: 10,
+                expires_at_ms: 1_000,
+                items: &items,
+            })
+            .expect("plan fixture");
+
+        let result = execute_stored_plan_with_hook(
+            &mut database,
+            &root,
+            "symlink-fault-plan",
+            "symlink-fault-operation",
+            20,
+            |ordinal, intent| {
+                if ordinal == 1 {
+                    symlink(&outside, intent.target.parent().expect("target parent"))?;
+                }
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(WorkflowError::ItemFailed { ordinal: 1, .. })
+        ));
+        assert!(targets[0].exists());
+        assert!(!sources[0].exists());
+        assert!(sources[1].exists());
+        assert!(!outside.join("second.txt").exists());
+        assert_eq!(
+            database
+                .operation("symlink-fault-operation")
+                .expect("operation query")
+                .expect("operation")
+                .status,
+            "recovery_needed"
+        );
+    }
+
     #[test]
     fn copy_plan_retains_source_and_undo_removes_only_the_verified_copy() {
         let directory = tempfile::tempdir().expect("temp directory");

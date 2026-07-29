@@ -533,6 +533,8 @@ pub struct ThresholdMetrics {
     pub precision: f32,
     pub recall: f32,
     pub f1: f32,
+    pub false_positive_rate: f32,
+    pub accuracy: f32,
 }
 
 /// 评估双阶段门限。没有正预测或正样本时相应指标返回 0，避免 NaN 污染报告。
@@ -563,6 +565,8 @@ pub fn evaluate_similarity_threshold(
     } else {
         0.0
     };
+    let false_positive_rate = safe_ratio(false_positives, false_positives + true_negatives);
+    let accuracy = safe_ratio(true_positives + true_negatives, samples.len());
     ThresholdMetrics {
         maximum_primary_distance,
         minimum_secondary_similarity,
@@ -573,6 +577,8 @@ pub fn evaluate_similarity_threshold(
         precision,
         recall,
         f1,
+        false_positive_rate,
+        accuracy,
     }
 }
 
@@ -583,6 +589,23 @@ pub fn select_similarity_threshold(
     primary_distances: &[u32],
     secondary_similarities: &[f32],
 ) -> Option<ThresholdMetrics> {
+    select_similarity_threshold_with_precision_floor(
+        samples,
+        primary_distances,
+        secondary_similarities,
+        0.0,
+    )
+}
+
+/// 在 F1 优化前施加最低 precision 门槛。文件清理相关场景应使用此入口，
+/// 让误报安全约束优先于召回率；没有候选满足门槛时明确返回 None。
+pub fn select_similarity_threshold_with_precision_floor(
+    samples: &[LabeledSimilaritySample],
+    primary_distances: &[u32],
+    secondary_similarities: &[f32],
+    minimum_precision: f32,
+) -> Option<ThresholdMetrics> {
+    let minimum_precision = minimum_precision.clamp(0.0, 1.0);
     primary_distances
         .iter()
         .flat_map(|&primary| {
@@ -590,6 +613,7 @@ pub fn select_similarity_threshold(
                 .iter()
                 .map(move |&secondary| evaluate_similarity_threshold(samples, primary, secondary))
         })
+        .filter(|metrics| metrics.precision >= minimum_precision && metrics.true_positives > 0)
         .max_by(|left, right| {
             left.f1
                 .total_cmp(&right.f1)
@@ -1221,6 +1245,8 @@ mod tests {
         assert_eq!(metrics.precision, 1.0);
         assert_eq!(metrics.recall, 1.0);
         assert_eq!(metrics.f1, 1.0);
+        assert_eq!(metrics.false_positive_rate, 0.0);
+        assert_eq!(metrics.accuracy, 1.0);
     }
 
     #[test]
@@ -1242,6 +1268,38 @@ mod tests {
         assert_eq!(selected.maximum_primary_distance, 4);
         assert_eq!(selected.minimum_secondary_similarity, 0.50);
         assert_eq!(selected.f1, 1.0);
+    }
+
+    #[test]
+    fn precision_floor_rejects_unsafe_high_recall_thresholds() {
+        let samples = [
+            LabeledSimilaritySample {
+                primary_distance: 2,
+                secondary_similarity: 0.90,
+                is_match: true,
+            },
+            LabeledSimilaritySample {
+                primary_distance: 6,
+                secondary_similarity: 0.45,
+                is_match: true,
+            },
+            LabeledSimilaritySample {
+                primary_distance: 4,
+                secondary_similarity: 0.40,
+                is_match: false,
+            },
+        ];
+        let selected = select_similarity_threshold_with_precision_floor(
+            &samples,
+            &[4, 6],
+            &[0.35, 0.80],
+            0.90,
+        )
+        .expect("strict safe threshold");
+        assert_eq!(selected.maximum_primary_distance, 4);
+        assert_eq!(selected.minimum_secondary_similarity, 0.80);
+        assert_eq!(selected.precision, 1.0);
+        assert!(selected.recall < 1.0);
     }
 
     #[test]

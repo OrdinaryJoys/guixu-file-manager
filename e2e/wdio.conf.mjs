@@ -1,15 +1,11 @@
 import { mkdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const here = dirname(fileURLToPath(import.meta.url));
-const repository = resolve(here, '..');
-const artifacts = resolve(here, '.artifacts');
-const appBinary = resolve(repository, 'target/debug/guixu-desktop');
+import { resolve } from 'node:path';
+import { appBinary, artifacts, here, library } from './paths.mjs';
 
 mkdirSync(resolve(artifacts, 'runtime'), { recursive: true });
 mkdirSync(resolve(artifacts, 'screenshots'), { recursive: true });
 process.env.GUIXU_DATA_DIR = resolve(artifacts, 'runtime');
+process.env.GUIXU_E2E_LIBRARY = library;
 
 export const config = {
   runner: 'local',
@@ -34,5 +30,3 @@ export const config = {
   reporters: ['spec'],
   mochaOpts: { ui: 'bdd', timeout: 60000 },
 };
-
-export const screenshotPath = resolve(artifacts, 'screenshots/native-settings.png');

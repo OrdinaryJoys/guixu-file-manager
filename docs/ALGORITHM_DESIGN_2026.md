@@ -108,7 +108,7 @@ provider 不接收 UI 传入的任意路径，只接收核心重新授权后的�
 
 1. schema 11：特征、运行记录和候选边。**已完成。**
 2. 文本 SimHash/MinHash、图片 dHash/pHash、EXIF 方向归一化、快照缓存、持久可控任务与 Web/App 统一只读候选 UI。**已完成双阶段基础版。**
-3. 精确候选基准和阈值评估器。**已完成 10k/100k 合成哈希基线与网格阈值指标；真实标注集是下一检查点。**
+3. 精确候选基准和阈值评估器。**已完成 10k/100k Criterion、1M 一次性规模门禁、训练/验证拆分、precision 安全门和网格阈值指标；真实标注集是下一检查点。**
 4. macOS Vision provider；真机基准通过后启用。
 5. 可选 EmbeddingGemma 128D 与 MobileCLIP2 provider，模型包独立下载校验。
 6. 50k 向量以上启用 HNSW，并以精确 top-k 持续监测召回。

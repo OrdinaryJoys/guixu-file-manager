@@ -1,4 +1,4 @@
-# 归序性能与阈值基线（2026-07-29）
+# 归序性能与阈值基线（2026-07-30）
 
 本文只记录可复现的已测结果，不把合成微基准等同于真实资料库性能。
 
@@ -19,7 +19,11 @@
 cargo bench -p guixu-analysis --bench similarity
 ```
 
-这些数字衡量候选索引本身，不包含文件读取、文本规范化、图片解码、SQLite I/O 或任务调度。均匀随机哈希的桶分布也不能代表相机连拍、模板文档等高聚集真实数据。下一基线必须补充 10 万真实文件端到端扫描/搜索/重复分析、1 百万候选规模、峰值 RSS 与 p50/p95。
+这些数字衡量候选索引本身，不包含文件读取、文本规范化、图片解码、SQLite I/O 或任务调度。均匀随机哈希的桶分布也不能代表相机连拍、模板文档等高聚集真实数据。下一基线必须补充 10 万真实文件端到端扫描/搜索/重复分析、1M 高聚集分布、峰值 RSS 与 p50/p95。
+
+### 1M 一次性规模门禁
+
+`cargo run --release -p guixu-analysis --example scale_similarity -- 1000000` 在同一环境完成 1,000,000 个确定性哈希，找到 161 对距离阈值内候选，耗时 53,200 ms，吞吐 18,796.85 elements/s。它证明百万级路径可完成，但不是统计基准，也未测峰值 RSS；53.2 秒仍属于下一轮并行化/内存布局优化对象。
 
 ## 双阶段相似验证
 
@@ -28,3 +32,12 @@ cargo bench -p guixu-analysis --bench similarity
 - 报告分别保存主距离、二次证据、最终加权分、特征耗时和候选耗时。
 
 `evaluate_similarity_threshold` 输出 TP/FP/TN/FN、precision、recall 与 F1；`select_similarity_threshold` 可在调用方给出的门限网格上选择 F1 最优且更保守的并列项。当前测试只证明计算与选择规则正确，不能证明产品门限已校准。真实标注集应包含真重复、近重复、相关但不可合并、完全不相关四类，并按来源隔离训练/验证集合。
+
+`evaluate_thresholds` CLI 强制区分 `train` 与 `validation`，并可要求最低 precision；验证集报告同时包含 FPR 和 accuracy。示例：
+
+```bash
+cargo run -p guixu-analysis --example evaluate_thresholds -- \
+  crates/guixu-analysis/tests/fixtures/threshold_labels_example.csv 0.90
+```
+
+仓库 CSV 是评估管线 fixture，不是产品准确率证据。真实门限必须用独立来源的人工标注数据重新训练和验证。

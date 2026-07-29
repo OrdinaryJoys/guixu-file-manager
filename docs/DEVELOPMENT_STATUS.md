@@ -1,6 +1,6 @@
 # 归序开发进度
 
-> 状态日期：2026-07-29
+> 状态日期：2026-07-30
 >
 > 当前版本：0.1.0（开发中）
 > 主线：Rust + Tauri 2
@@ -16,7 +16,7 @@
 | M2 文件浏览交互 | 完成 | 列表/网格、排序、多选、键盘导航、预览、打开和显示 |
 | M3 搜索与智能文件夹 | 完成 | Unicode/Trigram 搜索、结构化条件、智能文件夹持久化 |
 | M4 通用文件操作 | 完成 | 批量重命名、安全复制、通用移动与受控隔离区删除均已形成可恢复闭环 |
-| M5 算法生产化 | 进行中 | M5.1–M5.3 完成；M5.4 已形成 SimHash/MinHash 与 dHash/pHash 双阶段链路、精确 MIH 候选、阈值评估器和性能基线，真实标注集校准待推进 |
+| M5 算法生产化 | 进行中 | M5.1–M5.3 完成；M5.4 已形成双阶段链路、精确 MIH、precision 安全阈值工具、10k/100k 统计基线和 1M 规模门禁，真实标注集校准待推进 |
 | M6 平台增强与发布 | 待开始 | Quick Look、Spotlight/Vision、Windows provider、安装发布 |
 
 ## 当前可用能力
@@ -59,13 +59,14 @@
 
 截至状态日期（以最新一次全量命令输出为准）：
 
-- Rust workspace：87 项测试通过，0 项失败；
+- Rust workspace：89 项测试通过，0 项失败；
 - `cargo fmt --all --check`：通过；
 - 严格 Clippy：通过；
 - `node --check apps/desktop/web/app.js`：通过；
 - `node tools/verify_frontend_contract.mjs`：通过；
-- `cargo bench -p guixu-analysis --bench similarity`：10k 为 98.024 ms 中位估计，100k 为 1.3207 s 中位估计（macOS 15.7.7 / arm64，确定性合成哈希）；
-- `cd e2e && npm test`：macOS 嵌入式 WebDriver 原生 App 2 项通过，覆盖核心连接、安全初始态、设置分区、即时样式与持久化；
+- `cargo bench -p guixu-analysis --bench similarity`：10k 为 98.024 ms 中位估计，100k 为 1.3207 s 中位估计（macOS 15.7.7 / arm64，确定性合成哈希）；1M 一次性规模门禁耗时 53.2 s；
+- 阈值 CLI：支持 train/validation 分离、最低 precision 门禁，输出混淆矩阵、precision、recall、F1、FPR 与 accuracy；仓库示例标签仅验证管线，不冒充真实标注集；
+- `cd e2e && npm test`：macOS 嵌入式 WebDriver 原生 App 5 项通过，覆盖真实资料库扫描、搜索/预览、智能文件夹、整理计划、重复/相似报告、真实重命名/历史/撤销及设置；
 - `git diff --check`：通过；
 - Web 与 Tauri App 共用同一套 `apps/desktop/web` 前端资源和命令契约，搜索、智能文件夹、设置、预览、相似内容和任务状态未维护第二份实现；
 - GitHub Actions `Quality gates` 在 macOS 上持续执行 Rust、前端契约、生产依赖审计与原生 Tauri E2E；
@@ -78,6 +79,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 node --check apps/desktop/web/app.js
 node tools/verify_frontend_contract.mjs
 cargo bench -p guixu-analysis --bench similarity
+cargo run --release -p guixu-analysis --example scale_similarity -- 1000000
+cargo run -p guixu-analysis --example evaluate_thresholds -- crates/guixu-analysis/tests/fixtures/threshold_labels_example.csv 0.90
 cd e2e && npm test
 ```
 
@@ -85,6 +88,6 @@ cd e2e && npm test
 
 ## 下一开发检查点
 
-M4.1–M4.5、M5.1–M5.3 已完成；M5.4 已交付相似文本/图片双阶段复核、EXIF 方向归一化、MIH 候选、阈值评估器和可复现性能基线。下一增量建立真实标注集并校准阈值，再接入 macOS Vision provider；完成准确率验收前不开放批量清理。
+M4.1–M4.5、M5.1–M5.3 已完成；M5.4 已交付双阶段复核、EXIF 方向归一化、MIH 候选、precision 安全评估工具与 10k/100k/1M 基线。下一增量导入真实标注集并校准阈值，再接入 macOS Vision provider；完成准确率验收前不开放批量清理。
 
 每完成一个增量，依次执行：单元测试 → 临时目录集成测试 → 页面交互验证 → 更新本文和主方案状态。

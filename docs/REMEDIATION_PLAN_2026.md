@@ -1,8 +1,8 @@
 # 归序缺陷修复总体方案（2026-07 审计）
 
-> 状态：实施跟踪稿 v2（2026-07-29）
+> 状态：实施跟踪稿 v3（2026-07-30）
 >
-> 依据：2026-07-29 全库审计、源码回读、SQLite 数据层实测，以及代码/Web/原生窗口交叉验证；当前 87 个 Rust 测试全绿
+> 依据：2026-07-29 全库审计、源码回读、SQLite 数据层实测，以及代码/Web/原生窗口交叉验证；当前 89 个 Rust 测试全绿
 >
 > 关联文档：[MASTER_PLAN](./MASTER_PLAN.md)、[ALGORITHM_DESIGN_2026](./ALGORITHM_DESIGN_2026.md)、[UI_POLISH_PLAN](./UI_POLISH_PLAN.md)、[DEVELOPMENT_STATUS](./DEVELOPMENT_STATUS.md)
 >
@@ -14,12 +14,12 @@
 | --- | --- | --- | --- |
 | P0 数据安全 | 已完成 | 不完整扫描不再误标缺失；复制撤销逐项复检；跨卷移动按原文件 ID 更新身份并清理缓存 | 继续扩大真实外置卷组合 |
 | P1 状态机 | 核心完成 | 条件状态转移、启动消费 queued、活动任务去重、结果与完成状态同事务、worker 打开失败收敛到 failed | RecoveryNeeded 的高级人工恢复 UI 继续增强 |
-| P2 性能 | 部分验收 | FTS 更新触发器 guard；重复/相似分析使用 worker 连接与缓存；MIH 已建立 10k/100k Criterion 基线 | 10 万真实文件端到端与冷图片 p95 仍待建立 |
+| P2 性能 | 部分验收 | FTS 更新触发器 guard；重复/相似分析使用 worker 连接与缓存；MIH 已建立 10k/100k Criterion 与 1M 一次性规模基线 | 10 万真实文件端到端与冷图片 p95 仍待建立 |
 | P3 前端竞态 | 已完成 | 列表/搜索请求令牌、搜索态刷新保留上下文、计划创建互斥、通知优先级与键盘边界修复 | 持续真机回归 |
 | P4 搜索与身份 | 基础完成 | Unicode/Trigram、结构化查询、generation 绑定、稳定游标与相似阈值边界 | 卷 UUID 与更多平台 provider |
 | P5 低危清扫 | 持续进行 | 空特征不进入 SimHash、汉明距离越界显式报错、EXIF 方向归一化、UI/动效/窄窗口修复 | 随平台发布验收清扫 |
 
-本轮验证基线为 87 项 Rust 测试、前端契约、严格 Clippy、JS 语法、diff whitespace、官方 Tauri debug `.app` 构建、嵌入式 WebDriver 原生窗口 E2E，以及 1180×760 / 900×620 真实窗口点击验证。逐模块证据与未完成门禁见 [交叉验证矩阵](./CROSS_VALIDATION_2026.md)。附录保留原始审计清单作为可追溯记录，不代表每项仍处于未修复状态。
+本轮验证基线为 89 项 Rust 测试、前端契约、严格 Clippy、JS 语法、diff whitespace、官方 Tauri debug `.app` 构建、5 场景嵌入式 WebDriver 原生资料库 E2E，以及 1180×760 / 900×620 真实窗口点击验证。逐模块证据与未完成门禁见 [交叉验证矩阵](./CROSS_VALIDATION_2026.md)。附录保留原始审计清单作为可追溯记录，不代表每项仍处于未修复状态。
 
 ---
 

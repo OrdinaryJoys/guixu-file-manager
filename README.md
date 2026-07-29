@@ -52,7 +52,7 @@ node --check apps/desktop/web/app.js
 node tools/verify_frontend_contract.mjs
 ```
 
-截至 2026-07-29，Rust workspace 为 87 项测试通过，并已增加 Criterion 相似候选基准和 macOS 嵌入式 WebDriver 原生窗口 E2E。浏览器演示可用 `?demo=1` 快速验证页面交互；Web 演示与 Tauri App 共享唯一的 `apps/desktop/web` 前端资源、相似内容报告契约和任务状态。原根目录 Python 页面已移入 `legacy/python-prototype`，只保留作审计基线。完整的代码、Web 和原生 App 证据见 [交叉验证矩阵](docs/CROSS_VALIDATION_2026.md)；正式签名、公证和发布仍属于后续真机验收项。
+截至 2026-07-30，Rust workspace 为 89 项测试通过，并已增加 Criterion/百万级相似候选基准、训练/验证分离的阈值评估工具，以及 macOS 嵌入式 WebDriver 原生资料库 E2E。浏览器演示可用 `?demo=1` 快速验证页面交互；Web 演示与 Tauri App 共享唯一的 `apps/desktop/web` 前端资源、相似内容报告契约和任务状态。原根目录 Python 页面已移入 `legacy/python-prototype`，只保留作审计基线。完整的代码、Web 和原生 App 证据见 [交叉验证矩阵](docs/CROSS_VALIDATION_2026.md)；正式签名、公证和发布仍属于后续真机验收项。
 
 ## 旧项目合并
 

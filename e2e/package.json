@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "build:app": "cargo build -p guixu-desktop --features e2e",
-    "test": "npm run build:app && wdio run ./wdio.conf.mjs"
+    "prepare:fixture": "node ./prepare-fixture.mjs",
+    "test": "npm run build:app && npm run prepare:fixture && wdio run ./wdio.conf.mjs"
   },
   "overrides": {
     "@wdio/native-utils": "2.5.0"
