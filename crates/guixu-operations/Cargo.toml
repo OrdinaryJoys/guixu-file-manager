@@ -12,6 +12,7 @@ guixu-storage = { path = "../guixu-storage" }
 thiserror.workspace = true
 blake3.workspace = true
 libc.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

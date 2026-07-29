@@ -1,1 +1,1 @@
-{}
+{"main-window-events":{"identifier":"main-window-events","description":"允许归序主窗口监听后端任务状态事件，不开放前端事件发送能力。","local":true,"windows":["main"],"permissions":["core:event:allow-listen","core:event:allow-unlisten"]}}

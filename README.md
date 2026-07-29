@@ -19,14 +19,14 @@ cargo run -p guixu-desktop
 - macOS 原生目录选择、流式索引、稳定文件身份、路径重关联和游标分页；
 - SQLite WAL/FULL、持久任务租约、操作意图日志、崩溃恢复与禁止覆盖发布；
 - 同卷排他原子移动，跨卷保留元数据复制、BLAKE3 校验和发布后验证；
-- FTS5 Unicode/Trigram 搜索、结构化查询、智能文件夹、安全文本预览和任务中心；
+- FTS5 Unicode/Trigram 搜索、结构化查询、智能文件夹、安全文本预览、任务中心和持久化设置；
 - FSEvents 脏目录合并与权威快照对账；
-- 只读分层精确重复、魔数/容器分类和安全命名基础算法；
+- 带快照失效规则和持久哈希缓存的只读分层精确重复、魔数/容器分类和安全命名基础算法；
 - 列表/网格、排序、多选、键盘导航、批量栏、打开及“在访达中显示”。
 
-重命名、复制、通用移动、移入废纸篓、哈希缓存、相似图片/文本生产化和平台增强仍在后续里程碑中。完整状态、算法方案与验收门见 [整体方案](docs/MASTER_PLAN.md)。
+批量重命名、安全复制、通用移动与可恢复删除已完成“参数/原生目录选择 → 安全预检 → 计划确认 → 持久执行 → 历史 → 撤销”闭环；持久哈希缓存已接入重复分析，相似文本/图片基础 provider 已接入统一持久任务和只读 UI，阈值基准与平台增强仍在后续里程碑中。完整状态、算法方案与验收门见 [整体方案](docs/MASTER_PLAN.md)。
 
-当前里程碑和已知限制可快速查看 [开发进度](docs/DEVELOPMENT_STATUS.md)。
+当前里程碑和已知限制可快速查看 [开发进度](docs/DEVELOPMENT_STATUS.md)，界面组件和视觉约束见 [UI 设计系统](docs/UI_DESIGN_SYSTEM.md)，相似内容、端侧模型和混合检索选型见 [2026 算法与技术架构](docs/ALGORITHM_DESIGN_2026.md)。
 
 ## 核心安全约束
 
@@ -36,7 +36,7 @@ cargo run -p guixu-desktop
 - 同卷使用排他移动，跨卷采用复制、落盘、BLAKE3 校验和排他发布；
 - 默认不覆盖现有目标，不跟随符号链接；
 - 启动时只审计中断操作，歧义状态不会自动移动或删除文件；
-- 重复分析只提供分组和保留建议，不提供永久删除入口。
+- 重复分析提供可解释保留评分；清理必须逐项勾选并进入受控废纸篓计划，不提供永久删除入口。
 
 ## 数据与隐私
 
@@ -47,11 +47,12 @@ cargo run -p guixu-desktop
 ```bash
 cargo test --workspace
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings -A clippy::type-complexity
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 node --check apps/desktop/web/app.js
+node tools/verify_frontend_contract.mjs
 ```
 
-截至 2026-07-26，Rust workspace 为 49 项测试通过。浏览器演示可用 `?demo=1` 验证页面交互；安装后的真实系统打开/显示能力仍属于真机发布验收项。
+截至 2026-07-29，Rust workspace 为 81 项测试通过。浏览器演示可用 `?demo=1` 快速验证页面交互；Web 演示与 Tauri App 共享唯一的 `apps/desktop/web` 前端资源、相似内容报告契约和任务状态。原根目录 Python 页面已移入 `legacy/python-prototype`，只保留作审计基线。完整的代码、Web 和原生 App 证据见 [交叉验证矩阵](docs/CROSS_VALIDATION_2026.md)；正式签名、公证和发布仍属于后续真机验收项。
 
 ## 旧项目合并
 

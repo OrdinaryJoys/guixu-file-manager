@@ -16,7 +16,9 @@ impl RuntimeInfo {
         Self {
             api_version: API_VERSION,
             name: "归序".to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
+            version: std::option_env!("GUIXU_VERSION")
+                .unwrap_or(env!("CARGO_PKG_VERSION"))
+                .to_owned(),
             offline: true,
         }
     }

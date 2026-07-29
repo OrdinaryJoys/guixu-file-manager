@@ -50,6 +50,7 @@ pub struct ScanReport {
     pub progress: ScanProgress,
     pub issues: Vec<ScanIssue>,
     pub cancelled: bool,
+    pub incomplete: bool,
 }
 
 #[derive(Debug, Error)]
@@ -95,7 +96,9 @@ impl DirtyDirectorySet {
             .canonicalize()
             .unwrap_or_else(|_| directory.to_owned());
         let directory = normalized.as_path();
-        if !directory.starts_with(&self.root) {
+        if !directory.starts_with(&self.root)
+            && !directory.starts_with(self.root.parent().unwrap_or(&self.root))
+        {
             return;
         }
         if directory == self.root {
@@ -203,11 +206,12 @@ where
         return Err(ScanError::InvalidRoot(root));
     }
     let batch_size = options.batch_size.clamp(1, 2048);
-    let mut stack = vec![(fs::read_dir(&root)?, 0_usize)];
+    let mut stack = vec![(fs::read_dir(&root)?, root.clone(), 0_usize)];
     let mut batch = Vec::with_capacity(batch_size);
     let mut progress = ScanProgress::default();
     let mut issues = Vec::new();
     let mut cancelled = false;
+    let mut seen_identities: HashSet<(String, String)> = HashSet::new();
 
     while !stack.is_empty() {
         if !should_continue(&progress) {
@@ -227,7 +231,7 @@ where
                 push_issue(
                     &mut issues,
                     options.max_reported_issues,
-                    &root,
+                    &stack.last().expect("dir frame").1,
                     error.to_string(),
                 );
                 continue;
@@ -252,7 +256,7 @@ where
             continue;
         }
         if file_type.is_dir() {
-            let current_depth = stack.last().expect("directory frame").1;
+            let current_depth = stack.last().expect("dir frame").2;
             let name = entry.file_name();
             if options
                 .excluded_directory_names
@@ -265,7 +269,7 @@ where
                 continue;
             }
             match fs::read_dir(&path) {
-                Ok(directory) => stack.push((directory, current_depth + 1)),
+                Ok(directory) => stack.push((directory, path, current_depth + 1)),
                 Err(error) => {
                     progress.skipped_entries += 1;
                     push_issue(
@@ -293,12 +297,21 @@ where
             continue;
         };
         match observe_file(&path) {
-            Ok(observed) => batch.push(FileObservation {
-                new_file_id: stable_record_id(library_id, &observed.identity),
-                path: path_text.to_owned(),
-                identity: observed.identity,
-                snapshot: observed.snapshot,
-            }),
+            Ok(observed) => {
+                if !seen_identities.insert((
+                    observed.identity.volume_id.clone(),
+                    observed.identity.native_file_id.clone(),
+                )) {
+                    progress.skipped_entries += 1;
+                    continue;
+                }
+                batch.push(FileObservation {
+                    new_file_id: stable_record_id(library_id, &observed.identity),
+                    path: path_text.to_owned(),
+                    identity: observed.identity,
+                    snapshot: observed.snapshot,
+                });
+            }
             Err(error) => {
                 progress.skipped_entries += 1;
                 push_issue(
@@ -326,10 +339,12 @@ where
         &mut batch,
         &mut progress,
     )?;
+    let incomplete = !issues.is_empty();
     Ok(ScanReport {
         progress,
         issues,
         cancelled,
+        incomplete,
     })
 }
 
@@ -345,7 +360,18 @@ pub fn reconcile_snapshot<F>(
 where
     F: FnMut(&ScanProgress) -> bool,
 {
-    let canonical = directory.canonicalize()?;
+    let canonical = match directory.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ScanReport {
+                progress: ScanProgress::default(),
+                issues: vec![],
+                cancelled: false,
+                incomplete: false,
+            });
+        }
+        Err(error) => return Err(ScanError::Io(error)),
+    };
     let report = scan_library(
         database,
         library_id,
@@ -354,7 +380,7 @@ where
         options,
         should_continue,
     )?;
-    if !report.cancelled {
+    if !report.cancelled && !report.incomplete {
         let directory_text = canonical
             .to_str()
             .ok_or_else(|| ScanError::InvalidRoot(canonical.clone()))?;
@@ -562,5 +588,45 @@ mod tests {
                 .items
                 .is_empty()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_marks_scan_incomplete_and_preserves_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().join("root");
+        let blocked = root.join("locked");
+        fs::create_dir_all(&blocked).expect("create tree");
+        fs::write(root.join("visible.txt"), b"visible").expect("visible file");
+        fs::write(blocked.join("hidden.txt"), b"hidden").expect("hidden file");
+        let mut database = database(&directory.path().join("scan.sqlite3"));
+        reconcile_snapshot(
+            &mut database,
+            "library",
+            &root,
+            1000,
+            &ScanOptions::default(),
+            |_| true,
+        )
+        .expect("first scan");
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).expect("chmod blocked");
+        let report = reconcile_snapshot(
+            &mut database,
+            "library",
+            &root,
+            2000,
+            &ScanOptions::default(),
+            |_| true,
+        )
+        .expect("second scan");
+        assert!(report.incomplete);
+        assert!(!report.cancelled);
+        let _ = fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755));
+        let files = database
+            .list_files_page("library", None, 10)
+            .expect("list")
+            .items;
+        assert_eq!(files.len(), 2);
     }
 }

@@ -95,26 +95,42 @@ fn launch_spec(_path: &Path, _action: FileLaunchAction) -> Result<LaunchSpec, La
 }
 
 pub fn observe_file(path: impl AsRef<Path>) -> Result<ObservedFile, ObserveError> {
-    let metadata = fs::symlink_metadata(path)?;
+    let path_ref = path.as_ref();
+    let metadata = fs::symlink_metadata(path_ref)?;
     if metadata.file_type().is_symlink() {
         return Err(ObserveError::Symlink);
     }
     if !metadata.is_file() {
         return Err(ObserveError::NotAFile);
     }
-    observe_metadata(&metadata)
+    observe_metadata(path_ref, &metadata)
 }
 
 #[cfg(target_os = "macos")]
-fn observe_metadata(metadata: &fs::Metadata) -> Result<ObservedFile, ObserveError> {
+fn observe_metadata(path: &Path, metadata: &fs::Metadata) -> Result<ObservedFile, ObserveError> {
     use std::os::macos::fs::MetadataExt;
 
+    // P4：通过 libc::stat 取 st_gen 作为世代号，加固 inode 复用检测。
+    let generation = {
+        let path_c = std::ffi::CString::new(
+            path.as_os_str()
+                .to_str()
+                .ok_or_else(|| ObserveError::Io(std::io::Error::other("non-UTF-8 path")))?,
+        )
+        .map_err(|_| ObserveError::Io(std::io::Error::other("path contains NUL")))?;
+        let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::stat(path_c.as_ptr(), &mut stat_buf) } == 0 {
+            Some(stat_buf.st_gen.to_string())
+        } else {
+            None
+        }
+    };
     Ok(ObservedFile {
         identity: FileIdentity {
             platform: Platform::MacOs,
             volume_id: metadata.st_dev().to_string(),
             native_file_id: metadata.st_ino().to_string(),
-            generation: None,
+            generation,
         },
         snapshot: FileSnapshot {
             size: metadata.st_size(),
@@ -129,7 +145,7 @@ fn observe_metadata(metadata: &fs::Metadata) -> Result<ObservedFile, ObserveErro
 }
 
 #[cfg(target_os = "linux")]
-fn observe_metadata(metadata: &fs::Metadata) -> Result<ObservedFile, ObserveError> {
+fn observe_metadata(_path: &Path, metadata: &fs::Metadata) -> Result<ObservedFile, ObserveError> {
     use std::os::linux::fs::MetadataExt;
 
     Ok(ObservedFile {
@@ -149,7 +165,7 @@ fn observe_metadata(metadata: &fs::Metadata) -> Result<ObservedFile, ObserveErro
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn observe_metadata(_metadata: &fs::Metadata) -> Result<ObservedFile, ObserveError> {
+fn observe_metadata(_path: &Path, _metadata: &fs::Metadata) -> Result<ObservedFile, ObserveError> {
     Err(ObserveError::UnsupportedPlatform)
 }
 

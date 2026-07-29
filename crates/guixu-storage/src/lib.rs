@@ -1,11 +1,25 @@
 use std::path::Path;
 use std::time::Duration;
 
-use guixu_domain::{FileIdentity, FileSnapshot, JobStatus, OperationStatus};
+use guixu_domain::{
+    ConflictPolicy, FileIdentity, FileOperationKind, FileSnapshot, JobStatus, OperationStatus,
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 12;
+
+type OperationHeader = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -17,6 +31,12 @@ pub enum StorageError {
     InvalidProgress,
     #[error("搜索条件无效：{0}")]
     InvalidSearch(String),
+    #[error("数据库包含未知的文件操作类型：{0}")]
+    InvalidOperationKind(String),
+    #[error("数据库包含未知的冲突策略：{0}")]
+    InvalidConflictPolicy(String),
+    #[error("数据完整性约束冲突：{0}")]
+    ConstraintViolation(String),
     #[error("任务不存在或工作进程已经失去租约")]
     LeaseLost,
     #[error(transparent)]
@@ -70,6 +90,17 @@ pub struct NewPlanItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewPlan<'a> {
+    pub id: &'a str,
+    pub library_id: &'a str,
+    pub operation_kind: FileOperationKind,
+    pub conflict_policy: ConflictPolicy,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub items: &'a [NewPlanItem],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredPlanItem {
     pub ordinal: i64,
     pub file_id: Option<String>,
@@ -83,6 +114,8 @@ pub struct StoredPlanItem {
 pub struct StoredPlan {
     pub id: String,
     pub library_id: String,
+    pub operation_kind: FileOperationKind,
+    pub conflict_policy: ConflictPolicy,
     pub status: String,
     pub created_at_ms: i64,
     pub expires_at_ms: i64,
@@ -97,6 +130,8 @@ pub struct StoredOperationItem {
     pub target_path: String,
     pub source_identity: FileIdentity,
     pub target_identity: Option<FileIdentity>,
+    pub target_snapshot: Option<FileSnapshot>,
+    pub content_hash: Option<String>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
 }
@@ -106,6 +141,7 @@ pub struct StoredOperation {
     pub id: String,
     pub plan_id: String,
     pub library_id: String,
+    pub operation_kind: FileOperationKind,
     pub status: String,
     pub created_at_ms: i64,
     pub completed_at_ms: Option<i64>,
@@ -155,6 +191,39 @@ pub struct IndexedFile {
     pub current_path: String,
     pub size: u64,
     pub modified_at_ns: i64,
+    pub changed_at_ns: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileHashCache {
+    pub file_id: String,
+    pub size: u64,
+    pub modified_at_ns: i64,
+    pub changed_at_ns: i64,
+    pub algorithm: String,
+    pub quick_fingerprint: String,
+    pub content_hash: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileFeature {
+    pub file_id: String,
+    pub feature_kind: String,
+    pub model_version: String,
+    pub size: u64,
+    pub modified_at_ns: i64,
+    pub changed_at_ns: i64,
+    pub dimensions: u32,
+    pub quantization: String,
+    pub feature_blob: Vec<u8>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HashCacheOverview {
+    pub cached_files: u64,
+    pub fully_hashed_files: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +274,8 @@ pub struct SearchSpec {
     pub extension: Option<String>,
     pub minimum_size: Option<u64>,
     pub maximum_size: Option<u64>,
+    /// P5：当文本词元超过 24 个或 FTS 词元超过 12 个时为 true。
+    pub has_truncated_text: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,15 +337,23 @@ impl Database {
             )?;
             existing
         } else {
+            // P5：INSERT OR IGNORE 防范并发注册同路径竞态。
             transaction.execute(
-                "INSERT INTO libraries(id,name,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?3)",
+                "INSERT OR IGNORE INTO libraries(id,name,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?3)",
                 params![library_id, name, now_ms],
             )?;
             transaction.execute(
-                "INSERT INTO roots(id,library_id,path,enabled,created_at_ms) VALUES(?1,?2,?3,1,?4)",
+                "INSERT OR IGNORE INTO roots(id,library_id,path,enabled,created_at_ms) VALUES(?1,?2,?3,1,?4)",
                 params![root_id, library_id, root_path, now_ms],
             )?;
-            (library_id.to_owned(), name.to_owned())
+            // 若被忽略则在事务内重读以返回已有记录。
+            let existing: (String, String) = transaction.query_row(
+                "SELECT roots.library_id,libraries.name FROM roots
+                 JOIN libraries ON libraries.id=roots.library_id WHERE roots.path=?1",
+                [root_path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            existing
         };
         transaction.commit()?;
         Ok(LibraryRootRecord {
@@ -290,7 +369,7 @@ impl Database {
             .query_row(
                 "SELECT libraries.id,libraries.name,roots.path FROM roots
                  JOIN libraries ON libraries.id=roots.library_id
-                 WHERE roots.enabled=1 ORDER BY libraries.updated_at_ms DESC,roots.created_at_ms DESC LIMIT 1",
+                 WHERE roots.enabled=1 ORDER BY libraries.updated_at_ms DESC,roots.created_at_ms DESC,libraries.id LIMIT 1",
                 [],
                 |row| {
                     Ok(LibraryRootRecord {
@@ -377,19 +456,20 @@ impl Database {
         Ok(results)
     }
 
-    pub fn create_plan(
-        &self,
-        plan_id: &str,
-        library_id: &str,
-        created_at_ms: i64,
-        expires_at_ms: i64,
-        items: &[NewPlanItem],
-    ) -> Result<(), StorageError> {
+    pub fn create_plan(&self, plan: NewPlan<'_>) -> Result<(), StorageError> {
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
-            "INSERT INTO plans(id,library_id,status,created_at_ms,expires_at_ms)
-             VALUES(?1,?2,'ready',?3,?4)",
-            params![plan_id, library_id, created_at_ms, expires_at_ms],
+            "INSERT INTO plans(
+                id,library_id,operation_kind,conflict_policy,status,created_at_ms,expires_at_ms
+             ) VALUES(?1,?2,?3,?4,'ready',?5,?6)",
+            params![
+                plan.id,
+                plan.library_id,
+                plan.operation_kind.as_str(),
+                plan.conflict_policy.as_str(),
+                plan.created_at_ms,
+                plan.expires_at_ms
+            ],
         )?;
         {
             let mut statement = transaction.prepare(
@@ -397,11 +477,11 @@ impl Database {
                     plan_id,ordinal,file_id,source_path,target_path,expected_snapshot_json
                  ) VALUES(?1,?2,?3,?4,?5,?6)",
             )?;
-            for item in items {
+            for item in plan.items {
                 let expected =
                     serde_json::to_string(&(&item.expected_identity, &item.expected_snapshot))?;
                 statement.execute(params![
-                    plan_id,
+                    plan.id,
                     item.ordinal,
                     item.file_id,
                     item.source_path,
@@ -415,10 +495,11 @@ impl Database {
     }
 
     pub fn plan(&self, plan_id: &str) -> Result<Option<StoredPlan>, StorageError> {
-        let header: Option<(String, String, String, i64, i64)> = self
+        let header: Option<(String, String, String, String, String, i64, i64)> = self
             .connection
             .query_row(
-                "SELECT id,library_id,status,created_at_ms,expires_at_ms FROM plans WHERE id=?1",
+                "SELECT id,library_id,operation_kind,conflict_policy,status,created_at_ms,expires_at_ms
+                 FROM plans WHERE id=?1",
                 [plan_id],
                 |row| {
                     Ok((
@@ -427,13 +508,28 @@ impl Database {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((id, library_id, status, created_at_ms, expires_at_ms)) = header else {
+        let Some((
+            id,
+            library_id,
+            operation_kind,
+            conflict_policy,
+            status,
+            created_at_ms,
+            expires_at_ms,
+        )) = header
+        else {
             return Ok(None);
         };
+        let operation_kind = FileOperationKind::parse(&operation_kind)
+            .ok_or_else(|| StorageError::InvalidOperationKind(operation_kind))?;
+        let conflict_policy = ConflictPolicy::parse(&conflict_policy)
+            .ok_or_else(|| StorageError::InvalidConflictPolicy(conflict_policy))?;
         let mut statement = self.connection.prepare(
             "SELECT ordinal,file_id,source_path,target_path,expected_snapshot_json
              FROM plan_items WHERE plan_id=?1 ORDER BY ordinal",
@@ -463,6 +559,8 @@ impl Database {
         Ok(Some(StoredPlan {
             id,
             library_id,
+            operation_kind,
+            conflict_policy,
             status,
             created_at_ms,
             expires_at_ms,
@@ -488,15 +586,21 @@ impl Database {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT INTO operations(id,plan_id,status,created_at_ms) VALUES(?1,?2,?3,?4)",
+        let inserted = transaction.execute(
+            "INSERT INTO operations(id,plan_id,operation_kind,status,created_at_ms)
+             SELECT ?1,id,operation_kind,?3,?4 FROM plans
+             WHERE id=?2 AND status='ready' AND expires_at_ms > ?5",
             params![
                 operation_id,
                 plan_id,
                 operation_status_str(OperationStatus::IntentLogged),
+                created_at_ms,
                 created_at_ms
             ],
         )?;
+        if inserted != 1 {
+            return Err(StorageError::Sqlite(rusqlite::Error::QueryReturnedNoRows));
+        }
         {
             let mut statement = transaction.prepare(
                 "INSERT INTO operation_items(
@@ -519,6 +623,7 @@ impl Database {
         Ok(())
     }
 
+    /// 更新操作状态。拒绝从终态跃迁回正向执行状态（P1 守卫）。
     pub fn update_operation_status(
         &self,
         operation_id: &str,
@@ -529,11 +634,28 @@ impl Database {
         let (error_code, error_message) = error
             .map(|(code, message)| (Some(code), Some(message)))
             .unwrap_or((None, None));
+        // 仅拦截把已结束的操作重新拉回执行链的非法跃迁，
+        // completed→rollback_pending 等撤销路径不受影响。
+        let forward_execution_states = [
+            "draft",
+            "planned",
+            "preflight_passed",
+            "intent_logged",
+            "executing",
+        ];
+        let new_status = operation_status_str(status);
+        let guard = if forward_execution_states.contains(&new_status) {
+            " AND status NOT IN ('completed','rolled_back','cancelled','failed','recovery_needed')"
+        } else {
+            ""
+        };
         self.connection.execute(
-            "UPDATE operations SET status=?1,completed_at_ms=?2,error_code=?3,error_message=?4
-             WHERE id=?5",
+            &format!(
+                "UPDATE operations SET status=?1,completed_at_ms=?2,error_code=?3,error_message=?4
+                 WHERE id=?5{guard}"
+            ),
             params![
-                operation_status_str(status),
+                new_status,
                 completed_at_ms,
                 error_code,
                 error_message,
@@ -570,6 +692,33 @@ impl Database {
         Ok(())
     }
 
+    /// 记录已排他发布且完成内容校验的目标，撤销时据此拒绝删除后来被修改或替换的文件。
+    pub fn record_published_operation_item(
+        &self,
+        operation_id: &str,
+        ordinal: i64,
+        status: OperationStatus,
+        target_identity: &FileIdentity,
+        target_snapshot: &FileSnapshot,
+        content_hash: &str,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE operation_items
+             SET status=?1,target_identity_json=?2,target_snapshot_json=?3,content_hash=?4,
+                 error_code=NULL,error_message=NULL
+             WHERE operation_id=?5 AND ordinal=?6",
+            params![
+                operation_status_str(status),
+                serde_json::to_string(target_identity)?,
+                serde_json::to_string(target_snapshot)?,
+                content_hash,
+                operation_id,
+                ordinal
+            ],
+        )?;
+        Ok(())
+    }
+
     /// 返回启动时必须恢复的非终态操作。
     pub fn recovery_operations(&self) -> Result<Vec<RecoveryOperation>, StorageError> {
         let mut statement = self.connection.prepare(
@@ -589,7 +738,8 @@ impl Database {
 
     pub fn operation(&self, operation_id: &str) -> Result<Option<StoredOperation>, StorageError> {
         self.read_operation(
-            "SELECT operations.id,operations.plan_id,plans.library_id,operations.status,
+            "SELECT operations.id,operations.plan_id,plans.library_id,operations.operation_kind,
+                    operations.status,
                     operations.created_at_ms,operations.completed_at_ms,
                     operations.error_code,operations.error_message
              FROM operations JOIN plans ON plans.id=operations.plan_id
@@ -624,16 +774,7 @@ impl Database {
         query: &str,
         operation_id: &str,
     ) -> Result<Option<StoredOperation>, StorageError> {
-        let header: Option<(
-            String,
-            String,
-            String,
-            String,
-            i64,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-        )> = self
+        let header: Option<OperationHeader> = self
             .connection
             .query_row(query, [operation_id], |row| {
                 Ok((
@@ -645,6 +786,7 @@ impl Database {
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
                 ))
             })
             .optional()?;
@@ -652,6 +794,7 @@ impl Database {
             id,
             plan_id,
             library_id,
+            operation_kind,
             status,
             created_at_ms,
             completed_at_ms,
@@ -661,9 +804,11 @@ impl Database {
         else {
             return Ok(None);
         };
+        let operation_kind = FileOperationKind::parse(&operation_kind)
+            .ok_or_else(|| StorageError::InvalidOperationKind(operation_kind))?;
         let mut statement = self.connection.prepare(
             "SELECT ordinal,status,source_path,target_path,source_identity_json,
-                    target_identity_json,error_code,error_message
+                    target_identity_json,target_snapshot_json,content_hash,error_code,error_message
              FROM operation_items WHERE operation_id=?1 ORDER BY ordinal",
         )?;
         let rows = statement.query_map([operation_id], |row| {
@@ -676,6 +821,8 @@ impl Database {
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         let mut items = Vec::new();
@@ -687,6 +834,8 @@ impl Database {
                 target_path,
                 source_json,
                 target_json,
+                target_snapshot_json,
+                content_hash,
                 item_error_code,
                 item_error_message,
             ) = row?;
@@ -699,6 +848,10 @@ impl Database {
                 target_identity: target_json
                     .map(|json| serde_json::from_str(&json))
                     .transpose()?,
+                target_snapshot: target_snapshot_json
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()?,
+                content_hash,
                 error_code: item_error_code,
                 error_message: item_error_message,
             });
@@ -707,6 +860,7 @@ impl Database {
             id,
             plan_id,
             library_id,
+            operation_kind,
             status,
             created_at_ms,
             completed_at_ms,
@@ -739,6 +893,48 @@ impl Database {
         insert_job_event(&transaction, &job.id, "queued", None, job.created_at_ms)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// 原子复用相同类型与载荷的活动任务，避免重复点击产生并发全库工作。
+    pub fn enqueue_or_reuse_job(&mut self, job: &NewJob) -> Result<String, StorageError> {
+        let total = job
+            .progress_total
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StorageError::InvalidProgress)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row(
+                "SELECT id FROM jobs
+                 WHERE kind=?1 AND payload_json=?2
+                   AND status IN ('queued','running','pause_requested','paused','cancel_requested')
+                 ORDER BY created_at_ms,id LIMIT 1",
+                params![job.kind, job.payload_json],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            transaction.commit()?;
+            return Ok(existing);
+        }
+        transaction.execute(
+            "INSERT INTO jobs(
+                id,kind,status,payload_json,progress_current,progress_total,priority,created_at_ms,updated_at_ms
+             ) VALUES(?1,?2,'queued',?3,0,?4,?5,?6,?6)",
+            params![
+                job.id,
+                job.kind,
+                job.payload_json,
+                total,
+                job.priority,
+                job.created_at_ms
+            ],
+        )?;
+        insert_job_event(&transaction, &job.id, "queued", None, job.created_at_ms)?;
+        transaction.commit()?;
+        Ok(job.id.clone())
     }
 
     /// 先回收过期租约，再按“优先级降序、创建时间升序”原子认领一个任务。
@@ -833,6 +1029,19 @@ impl Database {
         if total.is_some_and(|total| current > total) {
             return Err(StorageError::InvalidProgress);
         }
+        // P5：total 未传时校验存储值，防止 current 超过已存 total 且进度不倒退。
+        if total.is_none() {
+            if let Ok((stored_current, Some(stored_total))) = self.connection.query_row(
+                "SELECT progress_current,progress_total FROM jobs WHERE id=?1",
+                [job_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            ) {
+                let cur = i64::try_from(current).map_err(|_| StorageError::InvalidProgress)?;
+                if cur > stored_total || cur < stored_current {
+                    return Err(StorageError::InvalidProgress);
+                }
+            }
+        }
         let current = i64::try_from(current).map_err(|_| StorageError::InvalidProgress)?;
         let total = total
             .map(i64::try_from)
@@ -901,13 +1110,15 @@ impl Database {
         Ok(())
     }
 
+    /// 确认暂停/取消请求，将任务置入 stable 状态。
+    /// 若任务在请求与确认之间已完成/失败，返回 `applied=false` 及当前状态。
     pub fn acknowledge_job_control(
         &self,
         job_id: &str,
         worker_id: &str,
         requested: JobStatus,
         now_ms: i64,
-    ) -> Result<(), StorageError> {
+    ) -> Result<JobTransferResult, StorageError> {
         let (requested_status, final_status, event) = match requested {
             JobStatus::PauseRequested => ("pause_requested", "paused", "paused"),
             JobStatus::CancelRequested => ("cancel_requested", "cancelled", "cancelled"),
@@ -924,12 +1135,13 @@ impl Database {
         )
     }
 
+    /// 将 running 任务标记为 completed。若已被暂停/取消则返回 `applied=false`（H6 修复）。
     pub fn complete_job(
         &self,
         job_id: &str,
         worker_id: &str,
         now_ms: i64,
-    ) -> Result<(), StorageError> {
+    ) -> Result<JobTransferResult, StorageError> {
         self.finish_owned_job(
             job_id,
             worker_id,
@@ -941,13 +1153,42 @@ impl Database {
         )
     }
 
+    /// 将持久结果与 running→completed 状态转移置于同一事务中。
+    pub fn complete_job_with_result(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        result_json: &str,
+        now_ms: i64,
+    ) -> Result<JobTransferResult, StorageError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let updated = transaction.execute(
+            "UPDATE jobs SET status='completed',lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=?1
+             WHERE id=?2 AND lease_owner=?3 AND status='running' AND lease_expires_at_ms>=?1",
+            params![now_ms, job_id, worker_id],
+        )?;
+        let result = ensure_transfer(updated, &transaction, job_id)?;
+        if result.applied {
+            transaction.execute(
+                "INSERT INTO job_results(job_id,result_json,created_at_ms) VALUES(?1,?2,?3)
+                 ON CONFLICT(job_id) DO UPDATE SET result_json=excluded.result_json,
+                     created_at_ms=excluded.created_at_ms",
+                params![job_id, result_json, now_ms],
+            )?;
+            insert_job_event(&transaction, job_id, "completed", None, now_ms)?;
+        }
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// 将 running 任务标记为 failed。若已被暂停/取消则返回 `applied=false`（H6 修复）。
     pub fn fail_job(
         &self,
         job_id: &str,
         worker_id: &str,
         now_ms: i64,
         detail_json: Option<&str>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<JobTransferResult, StorageError> {
         self.finish_owned_job(
             job_id,
             worker_id,
@@ -969,17 +1210,19 @@ impl Database {
         event: &str,
         now_ms: i64,
         detail_json: Option<&str>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<JobTransferResult, StorageError> {
         let transaction = self.connection.unchecked_transaction()?;
         let updated = transaction.execute(
             "UPDATE jobs SET status=?1,lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=?2
              WHERE id=?3 AND lease_owner=?4 AND status=?5 AND lease_expires_at_ms>=?2",
             params![final_status, now_ms, job_id, worker_id, expected_status],
         )?;
-        ensure_updated(updated)?;
-        insert_job_event(&transaction, job_id, event, detail_json, now_ms)?;
+        let result = ensure_transfer(updated, &transaction, job_id)?;
+        if result.applied {
+            insert_job_event(&transaction, job_id, event, detail_json, now_ms)?;
+        }
         transaction.commit()?;
-        Ok(())
+        Ok(result)
     }
 
     pub fn job_events(&self, job_id: &str) -> Result<Vec<JobEvent>, StorageError> {
@@ -996,6 +1239,88 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn save_job_result(
+        &self,
+        job_id: &str,
+        result_json: &str,
+        now_ms: i64,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "INSERT INTO job_results(job_id,result_json,created_at_ms) VALUES(?1,?2,?3)
+             ON CONFLICT(job_id) DO UPDATE SET result_json=excluded.result_json,
+                 created_at_ms=excluded.created_at_ms",
+            params![job_id, result_json, now_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn job_result(&self, job_id: &str) -> Result<Option<String>, StorageError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT result_json FROM job_results WHERE job_id=?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn save_file_feature(&self, feature: &FileFeature) -> Result<(), StorageError> {
+        self.connection.execute(
+            "INSERT INTO file_features(file_id,feature_kind,model_version,snapshot_size,
+                 snapshot_modified_at_ns,snapshot_changed_at_ns,dimensions,quantization,feature_blob,created_at_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             ON CONFLICT(file_id,feature_kind,model_version) DO UPDATE SET
+                 snapshot_size=excluded.snapshot_size,snapshot_modified_at_ns=excluded.snapshot_modified_at_ns,
+                 snapshot_changed_at_ns=excluded.snapshot_changed_at_ns,dimensions=excluded.dimensions,
+                 quantization=excluded.quantization,feature_blob=excluded.feature_blob,created_at_ms=excluded.created_at_ms",
+            params![feature.file_id, feature.feature_kind, feature.model_version,
+                i64::try_from(feature.size).map_err(|_| StorageError::InvalidProgress)?,
+                feature.modified_at_ns, feature.changed_at_ns, i64::from(feature.dimensions),
+                feature.quantization, feature.feature_blob, feature.created_at_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn file_feature(
+        &self,
+        file: &IndexedFile,
+        feature_kind: &str,
+        model_version: &str,
+    ) -> Result<Option<FileFeature>, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT snapshot_size,snapshot_modified_at_ns,snapshot_changed_at_ns,dimensions,
+                    quantization,feature_blob,created_at_ms FROM file_features
+             WHERE file_id=?1 AND feature_kind=?2 AND model_version=?3
+               AND snapshot_size=?4 AND snapshot_modified_at_ns=?5 AND snapshot_changed_at_ns=?6",
+                params![
+                    file.id,
+                    feature_kind,
+                    model_version,
+                    i64::try_from(file.size).map_err(|_| StorageError::InvalidProgress)?,
+                    file.modified_at_ns,
+                    file.changed_at_ns
+                ],
+                |row| {
+                    Ok(FileFeature {
+                        file_id: file.id.clone(),
+                        feature_kind: feature_kind.to_owned(),
+                        model_version: model_version.to_owned(),
+                        size: file.size,
+                        modified_at_ns: file.modified_at_ns,
+                        changed_at_ns: file.changed_at_ns,
+                        dimensions: u32::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                        quantization: row.get(4)?,
+                        feature_blob: row.get(5)?,
+                        created_at_ms: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
     /// 按路径和稳定记录 ID 做 keyset 分页；不会产生 OFFSET 深分页退化。
     pub fn list_files_page(
         &self,
@@ -1009,7 +1334,7 @@ impl Database {
             .map(|cursor| (cursor.path.as_str(), cursor.id.as_str()))
             .unwrap_or(("", ""));
         let mut statement = self.connection.prepare(
-            "SELECT id,current_path,size,modified_at_ns FROM files
+            "SELECT id,current_path,size,modified_at_ns,changed_at_ns FROM files
              WHERE library_id=?1 AND missing_since_ms IS NULL
                AND (current_path>?2 OR (current_path=?2 AND id>?3))
              ORDER BY current_path,id LIMIT ?4",
@@ -1023,17 +1348,19 @@ impl Database {
                     row.get::<_, String>(1)?,
                     size,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             },
         )?;
         let mut items = rows
             .map(|row| {
-                let (id, current_path, size, modified_at_ns) = row?;
+                let (id, current_path, size, modified_at_ns, changed_at_ns) = row?;
                 Ok(IndexedFile {
                     id,
                     current_path,
                     size: u64::try_from(size).map_err(|_| StorageError::InvalidProgress)?,
                     modified_at_ns,
+                    changed_at_ns,
                 })
             })
             .collect::<Result<Vec<_>, StorageError>>()?;
@@ -1070,24 +1397,186 @@ impl Database {
         library_id: &str,
         file_id: &str,
     ) -> Result<Option<IndexedFile>, StorageError> {
-        let row: Option<(String, String, i64, i64)> = self
+        let row: Option<(String, String, i64, i64, i64)> = self
             .connection
             .query_row(
-                "SELECT id,current_path,size,modified_at_ns FROM files
+                "SELECT id,current_path,size,modified_at_ns,changed_at_ns FROM files
                  WHERE library_id=?1 AND id=?2 AND missing_since_ms IS NULL",
                 params![library_id, file_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        row.map(|(id, current_path, size, modified_at_ns)| {
+        row.map(|(id, current_path, size, modified_at_ns, changed_at_ns)| {
             Ok(IndexedFile {
                 id,
                 current_path,
                 size: u64::try_from(size).map_err(|_| StorageError::InvalidProgress)?,
                 modified_at_ns,
+                changed_at_ns,
             })
         })
         .transpose()
+    }
+
+    /// 只返回与当前文件快照及算法版本完全匹配的哈希缓存。
+    pub fn file_hash_cache(
+        &self,
+        library_id: &str,
+        file: &IndexedFile,
+        algorithm: &str,
+    ) -> Result<Option<FileHashCache>, StorageError> {
+        let size = i64::try_from(file.size).map_err(|_| StorageError::FileTooLarge)?;
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT cache.file_id,cache.snapshot_size,cache.snapshot_modified_at_ns,
+                        cache.snapshot_changed_at_ns,cache.algorithm,cache.quick_fingerprint,
+                        cache.content_hash,cache.updated_at_ms
+                 FROM file_hash_cache cache JOIN files ON files.id=cache.file_id
+                 WHERE cache.file_id=?1 AND files.library_id=?2 AND files.missing_since_ms IS NULL
+                   AND cache.snapshot_size=?3 AND cache.snapshot_modified_at_ns=?4
+                   AND cache.snapshot_changed_at_ns=?5 AND cache.algorithm=?6",
+                params![
+                    file.id,
+                    library_id,
+                    size,
+                    file.modified_at_ns,
+                    file.changed_at_ns,
+                    algorithm
+                ],
+                |row| {
+                    let stored_size: i64 = row.get(1)?;
+                    Ok(FileHashCache {
+                        file_id: row.get(0)?,
+                        size: u64::try_from(stored_size).unwrap_or(0),
+                        modified_at_ns: row.get(2)?,
+                        changed_at_ns: row.get(3)?,
+                        algorithm: row.get(4)?,
+                        quick_fingerprint: row.get(5)?,
+                        content_hash: row.get(6)?,
+                        updated_at_ms: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// 快照仍与索引一致时才写入，避免把扫描后已变化文件的哈希发布到缓存。
+    pub fn save_file_hash_cache(
+        &self,
+        library_id: &str,
+        cache: &FileHashCache,
+    ) -> Result<bool, StorageError> {
+        let size = i64::try_from(cache.size).map_err(|_| StorageError::FileTooLarge)?;
+        Ok(self.connection.execute(
+            "INSERT INTO file_hash_cache(
+                file_id,snapshot_size,snapshot_modified_at_ns,snapshot_changed_at_ns,
+                algorithm,quick_fingerprint,content_hash,updated_at_ms
+             ) SELECT id,size,modified_at_ns,changed_at_ns,?6,?7,?8,?9 FROM files
+               WHERE id=?1 AND library_id=?2 AND missing_since_ms IS NULL
+                 AND size=?3 AND modified_at_ns=?4 AND changed_at_ns=?5
+             ON CONFLICT(file_id) DO UPDATE SET
+               snapshot_size=excluded.snapshot_size,
+               snapshot_modified_at_ns=excluded.snapshot_modified_at_ns,
+               snapshot_changed_at_ns=excluded.snapshot_changed_at_ns,
+               algorithm=excluded.algorithm,
+               quick_fingerprint=excluded.quick_fingerprint,
+               content_hash=excluded.content_hash,
+               updated_at_ms=excluded.updated_at_ms",
+            params![
+                cache.file_id,
+                library_id,
+                size,
+                cache.modified_at_ns,
+                cache.changed_at_ns,
+                cache.algorithm,
+                cache.quick_fingerprint,
+                cache.content_hash,
+                cache.updated_at_ms
+            ],
+        )? == 1)
+    }
+
+    /// P2：单事务批量写入哈希缓存，避免逐行 autocommit fsync。
+    pub fn save_file_hash_cache_batch(
+        &self,
+        library_id: &str,
+        caches: &[&FileHashCache],
+    ) -> Result<(), StorageError> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(StorageError::Sqlite)?;
+        for cache in caches {
+            let size = i64::try_from(cache.size).map_err(|_| StorageError::FileTooLarge)?;
+            transaction.execute(
+                "INSERT INTO file_hash_cache(
+                    file_id,snapshot_size,snapshot_modified_at_ns,snapshot_changed_at_ns,
+                    algorithm,quick_fingerprint,content_hash,updated_at_ms
+                 ) SELECT id,size,modified_at_ns,changed_at_ns,?6,?7,?8,?9 FROM files
+                   WHERE id=?1 AND library_id=?2 AND missing_since_ms IS NULL
+                     AND size=?3 AND modified_at_ns=?4 AND changed_at_ns=?5
+                 ON CONFLICT(file_id) DO UPDATE SET
+                   snapshot_size=excluded.snapshot_size,
+                   snapshot_modified_at_ns=excluded.snapshot_modified_at_ns,
+                   snapshot_changed_at_ns=excluded.snapshot_changed_at_ns,
+                   algorithm=excluded.algorithm,
+                   quick_fingerprint=excluded.quick_fingerprint,
+                   content_hash=excluded.content_hash,
+                   updated_at_ms=excluded.updated_at_ms",
+                params![
+                    cache.file_id,
+                    library_id,
+                    size,
+                    cache.modified_at_ns,
+                    cache.changed_at_ns,
+                    cache.algorithm,
+                    cache.quick_fingerprint,
+                    cache.content_hash,
+                    cache.updated_at_ms
+                ],
+            )?;
+        }
+        transaction.commit().map_err(StorageError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn hash_cache_overview(
+        &self,
+        library_id: &str,
+        algorithm: &str,
+    ) -> Result<HashCacheOverview, StorageError> {
+        let (cached, full): (i64, i64) = self.connection.query_row(
+            "SELECT COUNT(*),COUNT(cache.content_hash) FROM file_hash_cache cache
+             JOIN files ON files.id=cache.file_id
+             WHERE files.library_id=?1 AND files.missing_since_ms IS NULL
+               AND cache.algorithm=?2 AND cache.snapshot_size=files.size
+               AND cache.snapshot_modified_at_ns=files.modified_at_ns
+               AND cache.snapshot_changed_at_ns=files.changed_at_ns",
+            params![library_id, algorithm],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(HashCacheOverview {
+            cached_files: u64::try_from(cached).map_err(|_| StorageError::InvalidProgress)?,
+            fully_hashed_files: u64::try_from(full).map_err(|_| StorageError::InvalidProgress)?,
+        })
+    }
+
+    pub fn clear_hash_cache(&self, library_id: &str) -> Result<usize, StorageError> {
+        Ok(self.connection.execute(
+            "DELETE FROM file_hash_cache WHERE file_id IN (
+                SELECT id FROM files WHERE library_id=?1
+             )",
+            [library_id],
+        )?)
     }
 
     pub fn list_jobs(&self, limit: usize) -> Result<Vec<JobSummary>, StorageError> {
@@ -1136,15 +1625,28 @@ impl Database {
                 .text
                 .split_whitespace()
                 .all(|term| term.chars().count() >= 3);
-        let match_query = if use_trigram {
-            trigram_query(&spec.text)
+        // P4：含 1-2 字符词元（中文单双字搜索）时，回退到 LIKE 子串匹配。
+        // FTS unicode61 会把 CJK 连续串视为单个 token，非前缀搜索无法命中。
+        let has_short_terms = !spec.text.is_empty()
+            && !use_trigram
+            && spec
+                .text
+                .split_whitespace()
+                .any(|term| term.chars().count() < 3);
+        let match_query = if use_trigram || !has_short_terms {
+            if use_trigram {
+                trigram_query(&spec.text)
+            } else {
+                fts_query(&spec.text)
+            }
         } else {
-            fts_query(&spec.text)
+            String::new()
         };
         if match_query.is_empty()
             && spec.extension.is_none()
             && spec.minimum_size.is_none()
             && spec.maximum_size.is_none()
+            && !has_short_terms
         {
             return Ok(Vec::new());
         }
@@ -1160,39 +1662,102 @@ impl Database {
             .map(i64::try_from)
             .transpose()
             .map_err(|_| StorageError::FileTooLarge)?;
-        let sql = if match_query.is_empty() {
-            "SELECT files.id,files.current_path,files.size,files.modified_at_ns,0.0
+        // 短词回退：用 LIKE 子串匹配所有文本词元。
+        let short_like_patterns: Vec<String> = if has_short_terms {
+            spec.text
+                .split_whitespace()
+                .filter(|term| !term.is_empty())
+                .map(|term| format!("%{term}%"))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let sql = if !short_like_patterns.is_empty() {
+            let mut sql = String::from(
+                "SELECT files.id,files.current_path,files.size,\
+                 files.modified_at_ns,files.changed_at_ns,0.0 \
+                 FROM files WHERE files.library_id=?1 AND files.missing_since_ms IS NULL",
+            );
+            // P4：动态参数编号——从 ?2 开始，随条件递增。
+            let mut next_param = 2_usize;
+            for _ in &short_like_patterns {
+                sql.push_str(&format!(
+                    " AND lower(files.current_path) LIKE ?{next_param}"
+                ));
+                next_param += 1;
+            }
+            if extension_pattern.is_some() {
+                sql.push_str(&format!(
+                    " AND lower(files.current_path) LIKE ?{next_param}"
+                ));
+                next_param += 1;
+            }
+            if minimum_size.is_some() {
+                sql.push_str(&format!(" AND files.size>=?{next_param}"));
+                next_param += 1;
+            }
+            if maximum_size.is_some() {
+                sql.push_str(&format!(" AND files.size<=?{next_param}"));
+                next_param += 1;
+            }
+            sql.push_str(&format!(
+                " ORDER BY files.current_path,files.id LIMIT ?{next_param}"
+            ));
+            sql
+        } else if match_query.is_empty() {
+            "SELECT files.id,files.current_path,files.size,files.modified_at_ns,files.changed_at_ns,0.0
              FROM files
              WHERE files.library_id=?1 AND files.missing_since_ms IS NULL
                AND (?2 IS NULL OR lower(files.current_path) LIKE ?2)
                AND (?3 IS NULL OR files.size>=?3) AND (?4 IS NULL OR files.size<=?4)
-             ORDER BY files.current_path,files.id LIMIT ?5"
+             ORDER BY files.current_path,files.id LIMIT ?5".to_owned()
         } else if use_trigram {
-            "SELECT files.id,files.current_path,files.size,files.modified_at_ns,bm25(files_fts_trigram)
+            "SELECT files.id,files.current_path,files.size,files.modified_at_ns,files.changed_at_ns,bm25(files_fts_trigram)
              FROM files_fts_trigram JOIN files ON files.id=files_fts_trigram.file_id
              WHERE files_fts_trigram MATCH ?1 AND files_fts_trigram.library_id=?2 AND files.missing_since_ms IS NULL
                AND (?3 IS NULL OR lower(files.current_path) LIKE ?3)
                AND (?4 IS NULL OR files.size>=?4) AND (?5 IS NULL OR files.size<=?5)
-             ORDER BY bm25(files_fts_trigram),files.current_path,files.id LIMIT ?6"
+             ORDER BY bm25(files_fts_trigram),files.current_path,files.id LIMIT ?6".to_owned()
         } else {
-            "SELECT files.id,files.current_path,files.size,files.modified_at_ns,bm25(files_fts,10.0,2.0)
+            "SELECT files.id,files.current_path,files.size,files.modified_at_ns,files.changed_at_ns,bm25(files_fts,0.0,0.0,10.0,2.0)
              FROM files_fts JOIN files ON files.id=files_fts.file_id
              WHERE files_fts MATCH ?1 AND files_fts.library_id=?2 AND files.missing_since_ms IS NULL
                AND (?3 IS NULL OR lower(files.current_path) LIKE ?3)
                AND (?4 IS NULL OR files.size>=?4) AND (?5 IS NULL OR files.size<=?5)
-             ORDER BY bm25(files_fts,10.0,2.0),files.current_path,files.id LIMIT ?6"
+             ORDER BY bm25(files_fts,0.0,0.0,10.0,2.0),files.current_path,files.id LIMIT ?6".to_owned()
         };
-        let mut statement = self.connection.prepare(sql)?;
+        let mut statement = self.connection.prepare(&sql)?;
         let map_row = |row: &rusqlite::Row<'_>| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
-                row.get::<_, f64>(4)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, f64>(5)?,
             ))
         };
-        let rows = if match_query.is_empty() {
+        let rows = if !short_like_patterns.is_empty() {
+            // P4：短词 LIKE 回退，用动态参数列表。
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            params.push(Box::new(library_id.to_owned()));
+            for term in &short_like_patterns {
+                params.push(Box::new(term.clone()));
+            }
+            if extension_pattern.is_some() {
+                params.push(Box::new(extension_pattern.clone()));
+            }
+            if minimum_size.is_some() {
+                params.push(Box::new(minimum_size));
+            }
+            if maximum_size.is_some() {
+                params.push(Box::new(maximum_size));
+            }
+            params.push(Box::new(limit));
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            statement.query_map(param_refs.as_slice(), map_row)?
+        } else if match_query.is_empty() {
             statement.query_map(
                 params![
                     library_id,
@@ -1217,13 +1782,14 @@ impl Database {
             )?
         };
         rows.map(|row| {
-            let (id, current_path, size, modified_at_ns, rank) = row?;
+            let (id, current_path, size, modified_at_ns, changed_at_ns, rank) = row?;
             Ok(SearchHit {
                 file: IndexedFile {
                     id,
                     current_path,
                     size: u64::try_from(size).map_err(|_| StorageError::InvalidProgress)?,
                     modified_at_ns,
+                    changed_at_ns,
                 },
                 rank,
             })
@@ -1284,6 +1850,32 @@ impl Database {
         )? == 1)
     }
 
+    pub fn app_setting(&self, key: &str) -> Result<Option<String>, StorageError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT value_json FROM app_settings WHERE key=?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn save_app_setting(
+        &self,
+        key: &str,
+        value_json: &str,
+        updated_at_ms: i64,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "INSERT INTO app_settings(key,value_json,updated_at_ms) VALUES(?1,?2,?3)
+             ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,
+                 updated_at_ms=excluded.updated_at_ms",
+            params![key, value_json, updated_at_ms],
+        )?;
+        Ok(())
+    }
+
     /// 快照扫描结束后，将本轮没有看到的记录标记为缺失，但保留历史与身份信息。
     pub fn mark_unseen_missing(
         &self,
@@ -1297,6 +1889,20 @@ impl Database {
                AND (current_path=?3 OR substr(current_path,1,length(?3)+1)=?3||'/')",
             params![observed_at_ms, library_id, directory],
         )?)
+    }
+
+    /// 将一个已确认从磁盘移除的索引条目标记为缺失，保留身份和路径历史。
+    pub fn mark_file_missing(
+        &self,
+        library_id: &str,
+        path: &str,
+        observed_at_ms: i64,
+    ) -> Result<bool, StorageError> {
+        Ok(self.connection.execute(
+            "UPDATE files SET missing_since_ms=COALESCE(missing_since_ms,?1)
+             WHERE library_id=?2 AND current_path=?3 AND missing_since_ms IS NULL",
+            params![observed_at_ms, library_id, path],
+        )? == 1)
     }
 
     fn migrate(&mut self) -> Result<(), StorageError> {
@@ -1351,6 +1957,72 @@ impl Database {
             transaction.execute_batch(include_str!("../migrations/0005_smart_folder_rules.sql"))?;
             transaction.pragma_update(None, "user_version", 5)?;
             transaction.commit()?;
+            version = 5;
+        }
+        if version == 5 {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(include_str!("../migrations/0006_operation_kinds.sql"))?;
+            transaction.pragma_update(None, "user_version", 6)?;
+            transaction.commit()?;
+            version = 6;
+        }
+        if version == 6 {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(include_str!(
+                "../migrations/0007_published_file_verification.sql"
+            ))?;
+            transaction.pragma_update(None, "user_version", 7)?;
+            transaction.commit()?;
+            version = 7;
+        }
+        if version == 7 {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(include_str!("../migrations/0008_app_settings.sql"))?;
+            transaction.pragma_update(None, "user_version", 8)?;
+            transaction.commit()?;
+            version = 8;
+        }
+        if version == 8 {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(include_str!("../migrations/0009_file_hash_cache.sql"))?;
+            transaction.pragma_update(None, "user_version", 9)?;
+            transaction.commit()?;
+            version = 9;
+        }
+        if version == 9 {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(include_str!("../migrations/0010_job_results.sql"))?;
+            transaction.pragma_update(None, "user_version", 10)?;
+            transaction.commit()?;
+            version = 10;
+        }
+        if version == 10 {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction
+                .execute_batch(include_str!("../migrations/0011_similarity_features.sql"))?;
+            transaction.pragma_update(None, "user_version", 11)?;
+            transaction.commit()?;
+            version = 11;
+        }
+        if version == 11 {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(include_str!("../migrations/0012_fts_trigger_guard.sql"))?;
+            transaction.pragma_update(None, "user_version", 12)?;
+            transaction.commit()?;
         }
         Ok(())
     }
@@ -1382,7 +2054,9 @@ pub fn parse_search_query(query: &str) -> Result<SearchSpec, StorageError> {
     let mut minimum_size = None;
     let mut maximum_size = None;
     let mut size_seen = false;
+    let mut token_count = 0_usize;
     for token in query.split_whitespace().take(24) {
+        token_count += 1;
         if let Some(value) = token.strip_prefix("ext:") {
             let normalized = value.trim_start_matches('.').to_ascii_lowercase();
             if normalized.is_empty()
@@ -1413,11 +2087,13 @@ pub fn parse_search_query(query: &str) -> Result<SearchSpec, StorageError> {
     if minimum_size.is_some_and(|minimum| maximum_size.is_some_and(|maximum| minimum > maximum)) {
         return Err(StorageError::InvalidSearch("文件大小范围为空".to_owned()));
     }
+    let total_tokens = query.split_whitespace().count();
     Ok(SearchSpec {
         text: text.join(" "),
         extension,
         minimum_size,
         maximum_size,
+        has_truncated_text: token_count < total_tokens,
     })
 }
 
@@ -1519,20 +2195,38 @@ fn reconcile_file_on(
                 "INSERT INTO file_paths(file_id,path,valid_from_ms) VALUES(?1,?2,?3)",
                 params![file_id, path, observed_at_ms],
             )?;
+            // 路径变化时一并更新 current_path、身份和快照。
+            connection.execute(
+                "UPDATE files SET current_path=?1,size=?2,modified_at_ns=?3,changed_at_ns=?4,
+                 created_at_ns=?5,last_seen_at_ms=?6,missing_since_ms=NULL WHERE id=?7",
+                params![
+                    path,
+                    size,
+                    snapshot.modified_at_ns,
+                    snapshot.changed_at_ns,
+                    snapshot.created_at_ns,
+                    observed_at_ms,
+                    file_id
+                ],
+            )?;
+        } else {
+            // P2：路径不变时不更新 current_path，避免触发 FTS 同步。
+            connection.execute(
+                "UPDATE files SET size=?1,modified_at_ns=?2,changed_at_ns=?3,
+                 created_at_ns=?4,last_seen_at_ms=?5,missing_since_ms=NULL WHERE id=?6",
+                params![
+                    size,
+                    snapshot.modified_at_ns,
+                    snapshot.changed_at_ns,
+                    snapshot.created_at_ns,
+                    observed_at_ms,
+                    file_id
+                ],
+            )?;
         }
-        connection.execute(
-            "UPDATE files SET current_path=?1,size=?2,modified_at_ns=?3,changed_at_ns=?4,
-             created_at_ns=?5,last_seen_at_ms=?6,missing_since_ms=NULL WHERE id=?7",
-            params![
-                path,
-                size,
-                snapshot.modified_at_ns,
-                snapshot.changed_at_ns,
-                snapshot.created_at_ns,
-                observed_at_ms,
-                file_id
-            ],
-        )?;
+        if metadata_changed {
+            connection.execute("DELETE FROM file_hash_cache WHERE file_id=?1", [&file_id])?;
+        }
         Ok(ReconcileResult {
             file_id,
             kind: if moved {
@@ -1544,33 +2238,134 @@ fn reconcile_file_on(
             },
         })
     } else {
-        connection.execute(
-            "INSERT INTO files(id,library_id,platform,volume_id,native_file_id,generation,current_path,
-             size,modified_at_ns,changed_at_ns,created_at_ns,last_seen_at_ms)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-            params![
-                new_file_id,
-                library_id,
-                identity.platform.as_str(),
-                identity.volume_id,
-                identity.native_file_id,
-                identity.generation,
-                path,
-                size,
-                snapshot.modified_at_ns,
-                snapshot.changed_at_ns,
-                snapshot.created_at_ns,
-                observed_at_ms
-            ],
-        )?;
-        connection.execute(
-            "INSERT INTO file_paths(file_id,path,valid_from_ms) VALUES(?1,?2,?3)",
-            params![new_file_id, path, observed_at_ms],
-        )?;
-        Ok(ReconcileResult {
-            file_id: new_file_id.to_owned(),
-            kind: ReconcileKind::Inserted,
-        })
+        // H3 修复：身份查找落空可能意味着跨卷移动（新身份 + 已存在的 file_id）
+        // 或生成为空匹配（COALESCE(generation,'') 对 NULL 的处理缺口）。
+        // 先按记录 id 回退查找，命中则 UPDATE 身份列而非 INSERT（避免主键冲突）。
+        let existing_by_id: Option<(String, String, String, String, Option<String>)> = connection
+            .query_row(
+                "SELECT id,platform,volume_id,native_file_id,generation
+                 FROM files WHERE id=?1",
+                params![new_file_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((existing_id, old_platform, old_volume, old_native, old_generation)) =
+            existing_by_id
+        {
+            // 记录已存在但身份变化：跨卷移动或世代变更。
+            let identity_changed = old_platform != identity.platform.as_str()
+                || old_volume != identity.volume_id
+                || old_native != identity.native_file_id
+                || old_generation.as_deref().unwrap_or("")
+                    != identity.generation.as_deref().unwrap_or("");
+            // 防御：新身份不得已被其他记录占用。
+            if identity_changed {
+                let conflict: Option<String> = connection
+                    .query_row(
+                        "SELECT id FROM files
+                         WHERE library_id=?1 AND platform=?2 AND volume_id=?3
+                           AND native_file_id=?4 AND COALESCE(generation,'')=?5
+                           AND id <> ?6",
+                        params![
+                            library_id,
+                            identity.platform.as_str(),
+                            identity.volume_id,
+                            identity.native_file_id,
+                            identity.generation.as_deref().unwrap_or(""),
+                            existing_id
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if conflict.is_some() {
+                    return Err(StorageError::ConstraintViolation(format!(
+                        "目标身份已被文件 {} 占用，跨卷收敛中止",
+                        conflict.as_deref().unwrap()
+                    )));
+                }
+            }
+            // 闭合旧路径历史、写入新路径。
+            connection.execute(
+                "UPDATE file_paths SET valid_until_ms=?1
+                 WHERE file_id=?2 AND valid_until_ms IS NULL",
+                params![observed_at_ms, existing_id],
+            )?;
+            connection.execute(
+                "INSERT INTO file_paths(file_id,path,valid_from_ms)
+                 VALUES(?1,?2,?3)",
+                params![existing_id, path, observed_at_ms],
+            )?;
+            connection.execute(
+                "UPDATE files SET current_path=?1,size=?2,modified_at_ns=?3,
+                 changed_at_ns=?4,created_at_ns=?5,last_seen_at_ms=?6,
+                 missing_since_ms=NULL,
+                 platform=?7,volume_id=?8,native_file_id=?9,generation=?10
+                 WHERE id=?11",
+                params![
+                    path,
+                    size,
+                    snapshot.modified_at_ns,
+                    snapshot.changed_at_ns,
+                    snapshot.created_at_ns,
+                    observed_at_ms,
+                    identity.platform.as_str(),
+                    identity.volume_id,
+                    identity.native_file_id,
+                    identity.generation,
+                    existing_id
+                ],
+            )?;
+            if identity_changed {
+                // 身份变化后旧哈希缓存与特征均不可信。
+                connection.execute(
+                    "DELETE FROM file_hash_cache WHERE file_id=?1",
+                    [&existing_id],
+                )?;
+                connection.execute("DELETE FROM file_features WHERE file_id=?1", [&existing_id])?;
+            }
+            Ok(ReconcileResult {
+                file_id: existing_id,
+                kind: ReconcileKind::Moved,
+            })
+        } else {
+            // 真正的新记录：新身份 + 新 id。
+            connection.execute(
+                "INSERT INTO files(id,library_id,platform,volume_id,native_file_id,generation,
+                 current_path,size,modified_at_ns,changed_at_ns,created_at_ns,last_seen_at_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![
+                    new_file_id,
+                    library_id,
+                    identity.platform.as_str(),
+                    identity.volume_id,
+                    identity.native_file_id,
+                    identity.generation,
+                    path,
+                    size,
+                    snapshot.modified_at_ns,
+                    snapshot.changed_at_ns,
+                    snapshot.created_at_ns,
+                    observed_at_ms
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO file_paths(file_id,path,valid_from_ms)
+                 VALUES(?1,?2,?3)",
+                params![new_file_id, path, observed_at_ms],
+            )?;
+            Ok(ReconcileResult {
+                file_id: new_file_id.to_owned(),
+                kind: ReconcileKind::Inserted,
+            })
+        }
     }
 }
 
@@ -1592,6 +2387,38 @@ fn operation_status_str(status: OperationStatus) -> &'static str {
         RollbackPending => "rollback_pending",
         RolledBack => "rolled_back",
     }
+}
+
+/// 条件转移结果：是否成功、若失败则当前处于什么状态（供调用方决策）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobTransferResult {
+    pub applied: bool,
+    pub current_status: Option<String>,
+}
+
+fn ensure_transfer(
+    updated: usize,
+    connection: &Connection,
+    job_id: &str,
+) -> Result<JobTransferResult, StorageError> {
+    if updated == 1 {
+        return Ok(JobTransferResult {
+            applied: true,
+            current_status: None,
+        });
+    }
+    // 查询当前状态，供调用方判断是取消还是暂停。
+    let current: String = connection
+        .query_row(
+            "SELECT status FROM jobs WHERE id=?1",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::LeaseLost)?;
+    Ok(JobTransferResult {
+        applied: false,
+        current_status: Some(current),
+    })
 }
 
 fn ensure_updated(updated: usize) -> Result<(), StorageError> {
@@ -1631,21 +2458,38 @@ fn insert_job_event(
 }
 
 fn recover_expired_jobs(connection: &Connection, now_ms: i64) -> Result<(), rusqlite::Error> {
-    connection.execute(
-        "UPDATE jobs SET status='paused',lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=?1
-         WHERE status='pause_requested' AND lease_expires_at_ms<?1",
-        [now_ms],
+    /// P5：记录每个被恢复任务的审计事件。
+    fn log_recovery_events(
+        connection: &Connection,
+        from_status: &str,
+        to_status: &str,
+        event: &str,
+        now_ms: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let mut stmt =
+            connection.prepare("SELECT id FROM jobs WHERE status=?1 AND lease_expires_at_ms<?2")?;
+        let ids: Vec<String> = stmt
+            .query_map(params![from_status, now_ms], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for id in &ids {
+            insert_job_event(connection, id, event, None, now_ms)?;
+        }
+        connection.execute(
+            "UPDATE jobs SET status=?1,lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=?2
+             WHERE status=?3 AND lease_expires_at_ms<?2",
+            params![to_status, now_ms, from_status],
+        )?;
+        Ok(())
+    }
+    log_recovery_events(connection, "pause_requested", "paused", "paused", now_ms)?;
+    log_recovery_events(
+        connection,
+        "cancel_requested",
+        "cancelled",
+        "cancelled",
+        now_ms,
     )?;
-    connection.execute(
-        "UPDATE jobs SET status='cancelled',lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=?1
-         WHERE status='cancel_requested' AND lease_expires_at_ms<?1",
-        [now_ms],
-    )?;
-    connection.execute(
-        "UPDATE jobs SET status='queued',lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=?1
-         WHERE status='running' AND lease_expires_at_ms<?1",
-        [now_ms],
-    )?;
+    log_recovery_events(connection, "running", "queued", "expired", now_ms)?;
     Ok(())
 }
 
@@ -1690,6 +2534,186 @@ mod tests {
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .expect("foreign keys");
         assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn app_settings_persist_across_database_reopen() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("settings.sqlite3");
+        {
+            let database = Database::open(&path).expect("database");
+            database
+                .save_app_setting("desktop", r#"{"defaultViewMode":"grid","pageSize":50}"#, 10)
+                .expect("save settings");
+        }
+        let database = Database::open(&path).expect("reopen database");
+        assert_eq!(
+            database.app_setting("desktop").expect("read settings"),
+            Some(r#"{"defaultViewMode":"grid","pageSize":50}"#.to_owned())
+        );
+    }
+
+    #[test]
+    fn hash_cache_survives_moves_and_invalidates_on_snapshot_change() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let mut database =
+            Database::open(directory.path().join("hash-cache.sqlite3")).expect("database");
+        database
+            .register_library_root("library", "root", "测试", "/library", 1)
+            .expect("library");
+        database
+            .reconcile_file(
+                "library",
+                "file",
+                "/library/a.bin",
+                &identity(),
+                &snapshot(),
+                2,
+            )
+            .expect("index file");
+        let indexed = database
+            .indexed_file("library", "file")
+            .expect("read file")
+            .expect("indexed file");
+        let cache = FileHashCache {
+            file_id: indexed.id.clone(),
+            size: indexed.size,
+            modified_at_ns: indexed.modified_at_ns,
+            changed_at_ns: indexed.changed_at_ns,
+            algorithm: "blake3-v1".to_owned(),
+            quick_fingerprint: "quick".to_owned(),
+            content_hash: Some("full".to_owned()),
+            updated_at_ms: 3,
+        };
+        assert!(
+            database
+                .save_file_hash_cache("library", &cache)
+                .expect("cache hash")
+        );
+        assert_eq!(
+            database
+                .hash_cache_overview("library", "blake3-v1")
+                .expect("overview"),
+            HashCacheOverview {
+                cached_files: 1,
+                fully_hashed_files: 1,
+            }
+        );
+
+        database
+            .reconcile_file(
+                "library",
+                "unused",
+                "/library/moved.bin",
+                &identity(),
+                &snapshot(),
+                4,
+            )
+            .expect("move file");
+        let moved = database
+            .indexed_file("library", "file")
+            .expect("read moved")
+            .expect("moved file");
+        assert!(
+            database
+                .file_hash_cache("library", &moved, "blake3-v1")
+                .expect("moved cache")
+                .is_some()
+        );
+
+        let mut changed = snapshot();
+        changed.modified_at_ns += 1;
+        database
+            .reconcile_file(
+                "library",
+                "unused",
+                "/library/moved.bin",
+                &identity(),
+                &changed,
+                5,
+            )
+            .expect("change file");
+        let changed_file = database
+            .indexed_file("library", "file")
+            .expect("read changed")
+            .expect("changed file");
+        assert!(
+            database
+                .file_hash_cache("library", &changed_file, "blake3-v1")
+                .expect("invalidated cache")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn similarity_features_are_snapshot_and_model_version_bound() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let mut database = Database::open(directory.path().join("features.sqlite3")).expect("db");
+        database
+            .register_library_root("library", "root", "测试", "/library", 1)
+            .expect("library");
+        database
+            .reconcile_file(
+                "library",
+                "file",
+                "/library/a.txt",
+                &identity(),
+                &snapshot(),
+                2,
+            )
+            .expect("file");
+        let indexed = database
+            .indexed_file("library", "file")
+            .expect("read")
+            .expect("file");
+        database
+            .save_file_feature(&FileFeature {
+                file_id: indexed.id.clone(),
+                feature_kind: "text_simhash".to_owned(),
+                model_version: "simhash-v1".to_owned(),
+                size: indexed.size,
+                modified_at_ns: indexed.modified_at_ns,
+                changed_at_ns: indexed.changed_at_ns,
+                dimensions: 64,
+                quantization: "binary64".to_owned(),
+                feature_blob: 42_u64.to_le_bytes().to_vec(),
+                created_at_ms: 3,
+            })
+            .expect("feature");
+        assert!(
+            database
+                .file_feature(&indexed, "text_simhash", "simhash-v1")
+                .expect("cached")
+                .is_some()
+        );
+        assert!(
+            database
+                .file_feature(&indexed, "text_simhash", "simhash-v2")
+                .expect("version")
+                .is_none()
+        );
+        let mut changed = snapshot();
+        changed.modified_at_ns += 1;
+        database
+            .reconcile_file(
+                "library",
+                "unused",
+                "/library/a.txt",
+                &identity(),
+                &changed,
+                4,
+            )
+            .expect("change");
+        let changed_file = database
+            .indexed_file("library", "file")
+            .expect("read")
+            .expect("file");
+        assert!(
+            database
+                .file_feature(&changed_file, "text_simhash", "simhash-v1")
+                .expect("stale")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1854,12 +2878,14 @@ mod tests {
                 )
                 .expect("index plan fixture");
             database
-                .create_plan(
-                    "plan",
-                    "library",
-                    10,
-                    910,
-                    &[NewPlanItem {
+                .create_plan(NewPlan {
+                    id: "plan",
+                    library_id: "library",
+                    operation_kind: FileOperationKind::Rename,
+                    conflict_policy: ConflictPolicy::Abort,
+                    created_at_ms: 10,
+                    expires_at_ms: 910,
+                    items: &[NewPlanItem {
                         ordinal: 0,
                         file_id: "file-1".to_owned(),
                         source_path: "/source.txt".to_owned(),
@@ -1867,7 +2893,7 @@ mod tests {
                         expected_identity: identity(),
                         expected_snapshot: snapshot(),
                     }],
-                )
+                })
                 .expect("create plan");
             database
                 .log_operation_intent(
@@ -1886,11 +2912,14 @@ mod tests {
         let database = Database::open(&path).expect("reopen db");
         let plan = database.plan("plan").expect("read plan").expect("plan");
         assert_eq!(plan.status, "ready");
+        assert_eq!(plan.operation_kind, FileOperationKind::Rename);
+        assert_eq!(plan.conflict_policy, ConflictPolicy::Abort);
         assert_eq!(plan.items.len(), 1);
         assert_eq!(plan.items[0].expected_snapshot, snapshot());
         let history = database.operation_history("library", 20).expect("history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].items[0].source_identity, identity());
+        assert_eq!(history[0].operation_kind, FileOperationKind::Rename);
         assert_eq!(history[0].status, "intent_logged");
     }
 
@@ -1930,6 +2959,48 @@ mod tests {
             .expect("claim")
             .expect("job");
         assert_eq!(second.id, "new-high");
+    }
+
+    #[test]
+    fn active_equivalent_job_is_reused() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let mut database = Database::open(directory.path().join("jobs.sqlite3")).expect("open db");
+        let first = database
+            .enqueue_or_reuse_job(&job("scan-1", 100, 1))
+            .expect("first enqueue");
+        let second = database
+            .enqueue_or_reuse_job(&job("scan-2", 100, 2))
+            .expect("reuse enqueue");
+        assert_eq!(first, "scan-1");
+        assert_eq!(second, "scan-1");
+        let count: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
+            .expect("job count");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn result_and_completion_commit_atomically() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let mut database = Database::open(directory.path().join("jobs.sqlite3")).expect("open db");
+        database.enqueue_job(&job("scan", 100, 1)).expect("enqueue");
+        database
+            .claim_next_job("worker", 10, 100)
+            .expect("claim")
+            .expect("job");
+        let transfer = database
+            .complete_job_with_result("scan", "worker", r#"{"ok":true}"#, 11)
+            .expect("complete with result");
+        assert!(transfer.applied);
+        assert_eq!(
+            database.job_result("scan").expect("result"),
+            Some(r#"{"ok":true}"#.to_owned())
+        );
+        assert_eq!(
+            database.job_status("scan").expect("status"),
+            Some(JobStatus::Completed)
+        );
     }
 
     #[test]
@@ -2011,6 +3082,29 @@ mod tests {
     }
 
     #[test]
+    fn job_results_are_persistent_and_replaceable() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("job-results.sqlite3");
+        {
+            let database = Database::open(&path).expect("open db");
+            database
+                .enqueue_job(&job("analysis", 50, 1))
+                .expect("enqueue");
+            database
+                .save_job_result("analysis", r#"{"groups":1}"#, 10)
+                .expect("save result");
+            database
+                .save_job_result("analysis", r#"{"groups":2}"#, 11)
+                .expect("replace result");
+        }
+        let database = Database::open(&path).expect("reopen db");
+        assert_eq!(
+            database.job_result("analysis").expect("read result"),
+            Some(r#"{"groups":2}"#.to_owned())
+        );
+    }
+
+    #[test]
     fn invalid_progress_and_stale_completion_are_rejected() {
         let directory = tempfile::tempdir().expect("temp directory");
         let mut database = Database::open(directory.path().join("jobs.sqlite3")).expect("open db");
@@ -2023,10 +3117,10 @@ mod tests {
             database.update_job_progress("scan", "worker", 11, Some(10), 11),
             Err(StorageError::InvalidProgress)
         ));
-        assert!(matches!(
-            database.complete_job("scan", "worker", 16),
-            Err(StorageError::LeaseLost)
-        ));
+        let result = database
+            .complete_job("scan", "worker", 16)
+            .expect("complete_job query");
+        assert!(!result.applied, "stale completion should be rejected");
     }
 
     #[test]
@@ -2127,6 +3221,7 @@ mod tests {
                 extension: Some("pdf".to_owned()),
                 minimum_size: Some(10 * 1024 * 1024 + 1),
                 maximum_size: None,
+                has_truncated_text: false,
             }
         );
         assert!(matches!(
@@ -2230,6 +3325,53 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_version_five_operation_history_with_safe_defaults() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("version-five.sqlite3");
+        {
+            let connection = Connection::open(&path).expect("open v5 db");
+            connection
+                .execute_batch(include_str!("../migrations/0001_initial.sql"))
+                .expect("create v1 schema");
+            connection
+                .execute_batch(include_str!("../migrations/0002_search.sql"))
+                .expect("apply v2");
+            connection
+                .execute_batch(include_str!("../migrations/0003_missing_files.sql"))
+                .expect("apply v3");
+            connection
+                .execute_batch(include_str!("../migrations/0004_trigram_search.sql"))
+                .expect("apply v4");
+            connection
+                .execute_batch(include_str!("../migrations/0005_smart_folder_rules.sql"))
+                .expect("apply v5");
+            connection
+                .execute_batch(
+                    "INSERT INTO libraries(id,name,created_at_ms,updated_at_ms)
+                     VALUES('library','测试',1,1);
+                     INSERT INTO plans(id,library_id,status,created_at_ms,expires_at_ms)
+                     VALUES('plan','library','ready',2,999);
+                     INSERT INTO operations(id,plan_id,status,created_at_ms)
+                     VALUES('operation','plan','completed',3);",
+                )
+                .expect("v5 history fixture");
+            connection
+                .pragma_update(None, "user_version", 5)
+                .expect("mark v5");
+        }
+        let database = Database::open(&path).expect("upgrade v5 database");
+        let plan = database.plan("plan").expect("read plan").expect("plan");
+        assert_eq!(plan.operation_kind, FileOperationKind::Organize);
+        assert_eq!(plan.conflict_policy, ConflictPolicy::Abort);
+        let operation = database
+            .operation("operation")
+            .expect("read operation")
+            .expect("operation");
+        assert_eq!(operation.operation_kind, FileOperationKind::Organize);
+        assert_eq!(database.schema_version().expect("version"), SCHEMA_VERSION);
+    }
+
+    #[test]
     fn upgrades_a_version_one_database_without_losing_files() {
         let directory = tempfile::tempdir().expect("temp directory");
         let path = directory.path().join("upgrade.sqlite3");
@@ -2259,5 +3401,83 @@ mod tests {
             )
             .expect("migration table");
         assert_eq!(smart_table, 1);
+    }
+
+    // ─── P0 回归测试 ───
+
+    #[test]
+    fn reconcile_handles_identity_shift_for_existing_record_id() {
+        // 模拟跨卷移动：身份变化（新 volume+inode），但 file_id 不变。
+        // 旧行为是 INSERT → 主键冲突；修复后应为 UPDATE（H3）。
+        let directory = tempfile::tempdir().expect("temp directory");
+        let mut database =
+            Database::open(directory.path().join("crossvol.sqlite3")).expect("open db");
+        database
+            .connection()
+            .execute(
+                "INSERT INTO libraries(id,name,created_at_ms,updated_at_ms)
+                 VALUES('library','测试',1,1)",
+                [],
+            )
+            .expect("insert library");
+
+        // 1. 初始插入：源卷身份
+        let mut source_identity = identity();
+        source_identity.volume_id = "volume-src".to_owned();
+        source_identity.native_file_id = "inode-src".to_owned();
+        database
+            .reconcile_file(
+                "library",
+                "file-abc",
+                "/source/path.txt",
+                &source_identity,
+                &snapshot(),
+                1000,
+            )
+            .expect("initial insert");
+
+        // 2. 跨卷移动后对账：新身份，同 file_id
+        let mut target_identity = identity();
+        target_identity.volume_id = "volume-dst".to_owned();
+        target_identity.native_file_id = "inode-dst".to_owned();
+        let mut moved_snapshot = snapshot();
+        moved_snapshot.changed_at_ns = 2000;
+        let result = database
+            .reconcile_file(
+                "library",
+                "file-abc",
+                "/target/path.txt",
+                &target_identity,
+                &moved_snapshot,
+                2000,
+            )
+            .expect("reconcile after cross-volume move");
+
+        // 断语言修复效果：身份变化应为 Moved，不是 Inserted。
+        assert_eq!(result.kind, ReconcileKind::Moved);
+        assert_eq!(result.file_id, "file-abc");
+
+        // 新路径在 file_paths 中应有历史记录。
+        let path_count: i64 = database
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM file_paths WHERE file_id='file-abc'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count paths");
+        assert_eq!(path_count, 2); // /source + /target
+
+        // 身份列已更新。
+        let (updated_volume, updated_inode): (String, String) = database
+            .connection()
+            .query_row(
+                "SELECT volume_id,native_file_id FROM files WHERE id='file-abc'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read updated identity");
+        assert_eq!(updated_volume, "volume-dst");
+        assert_eq!(updated_inode, "inode-dst");
     }
 }

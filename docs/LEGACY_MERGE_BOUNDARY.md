@@ -46,4 +46,4 @@ Web 页面 / Tauri 桌面壳
 4. 接入目录事件源：事件只触发重新扫描；验证突发事件合并、重命名、删除和休眠恢复。
 5. 最后重写算法：分类、相似重复、智能命名和批处理分别建立基准集、正确率指标与事务安全测试后替换。
 
-当前状态：页面主路由、文件夹授权、基础文件浏览/搜索/预览、打开/显示、后台索引和 FSEvents 对账已经接入；Quick Look、Spotlight、PDF/Vision 与 Windows provider 尚未完成。`guixu-analysis` 已有分类、精确重复和命名的基础实现，但哈希缓存、稳定保留评分及图片/文本相似算法仍需按真实基准集生产化。旧算法继续维持“禁止直接复制”边界。完整顺序与验收标准见 [整体方案](./MASTER_PLAN.md)。
+当前状态：页面主路由、文件夹授权、文件浏览/搜索/预览、打开/显示、后台索引和 FSEvents 对账已经接入；Quick Look、Spotlight、PDF/Vision 与 Windows provider 尚未完成。`guixu-analysis` 已有带持久缓存的分层精确重复、稳定保留评分、文本 SimHash 和 EXIF 归一化图片 dHash；相似能力仍保持只读，待真实基准集评估 pHash/MinHash 二次验证。早期 Python/Web 原型已集中归档到 `legacy/python-prototype`，不再作为启动入口；旧算法继续维持“禁止直接复制”边界。完整证据见 [交叉验证矩阵](./CROSS_VALIDATION_2026.md)，顺序与验收标准见 [整体方案](./MASTER_PLAN.md)。
