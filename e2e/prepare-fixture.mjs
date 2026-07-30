@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { artifacts, library } from './paths.mjs';
 
@@ -11,4 +11,7 @@ const duplicateText = '项目计划包含预算、交付时间、验收标准、
 writeFileSync(resolve(library, 'project-plan.md'), duplicateText);
 writeFileSync(resolve(library, 'project-plan-copy.md'), duplicateText);
 writeFileSync(resolve(library, 'contract-final.txt'), 'Contract final version. Confidential customer agreement and delivery schedule for local preview verification.');
-writeFileSync(resolve(library, 'notes.json'), '{"topic":"local file manager","status":"verified","tags":["search","smart-folder"]}');
+const notesPath = resolve(library, 'notes.json');
+writeFileSync(notesPath, '{"topic":"local file manager","status":"verified","tags":["search","smart-folder"]}');
+const oldTimestamp = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000);
+utimesSync(notesPath, oldTimestamp, oldTimestamp);

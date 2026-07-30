@@ -7,7 +7,7 @@
 | 层级 | 验证内容 | 当前门禁 |
 | --- | --- | --- |
 | L1 静态契约 | DOM id、设置页目标、Tauri IPC 注册、CSS 变量与结构、Web/App 唯一入口 | `node tools/verify_frontend_contract.mjs` |
-| L2 算法与数据 | 搜索、身份、迁移、任务状态机、事务、重复与相似候选、EXIF 方向、旧设置兼容 | `cargo test --workspace`（89 项） |
+| L2 算法与数据 | 搜索、身份、迁移、任务状态机、事务、清理建议、重复与相似候选、EXIF 方向、旧设置兼容 | `cargo test --workspace`（91 项） |
 | L3 编译质量 | 格式、全部 target/feature 的 warning、JS 语法、diff 空白 | fmt、严格 Clippy、`node --check`、`git diff --check` |
 | L4 Web 交互 | 搜索、视图切换、设置、计划、执行、历史、撤销、控制台 | 同源 Web 演示真实点击 |
 | L5 App 交互 | Tauri IPC、真实索引、系统选择器、窗口缩放、macOS 字体与 WKWebView 渲染 | debug `.app` 真实窗口点击与截图 + 5 场景嵌入式 WebDriver E2E |
@@ -21,6 +21,7 @@
 | 索引与对账 | 增量扫描、稳定身份、文件事件合并、失败保守 | worker 扫描、FSEvents 脏目录、generation、incomplete scan 保护 | L2 | App 真实资料库 | 核心完成；真实外置卷组合仍需扩大 |
 | 搜索 | SQLite FTS5 + 结构化过滤 + 稳定分页 | Unicode/trigram、短词回退、`ext:`/`size:`、游标 | L2 + L1 | Web demo 与 App 搜索 | 完成；单字大库性能基准待做 |
 | 智能文件夹 | 保存查询而非复制文件 | SQLite 持久化查询、执行和删除 | L1/L2 | Web/App 点击 | 完成 |
+| 清理建议 | 只读、可解释、写操作隔离 | 索引元数据分页分析；大文件、长期未修改、临时文件、陈旧下载四类原因 | L1/L2 + 原生 E2E | App 真实候选与弹窗交互 | 完成；不提供直接删除 |
 | 安全操作 | 计划 → 预检 → 意图日志 → 发布 → 撤销 | rename/move/copy/trash、排他发布、BLAKE3、逐项回滚验证 | L2/L3 | App 自动执行真实重命名、历史与撤销 | 核心完成；跨卷和异常断电需持续真机覆盖 |
 | 后台任务 | 可恢复状态机、租约、幂等消费、控制事件 | queued/running/pause/cancel/completed/failed + job result 同事务 | L2 | App E2E 回填重复/相似报告 | 核心完成；已补中途冲突与目录符号链接逃逸注入，断电/拔盘矩阵仍待扩大 |
 | 精确重复 | 大小 → 快速指纹 → 完整哈希；缓存与确定性保留解释 | BLAKE3 分层、持久缓存、只读报告、受控清理计划 | L2 | Web/App 报告 | 完成；10 万/100 万文件性能门禁待建 |

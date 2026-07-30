@@ -836,6 +836,77 @@ pub fn image_phash(image: &DynamicImage) -> u64 {
         })
 }
 
+const DAY_NS: i64 = 86_400_000_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupPolicy {
+    pub large_file_bytes: u64,
+    pub old_file_age_ns: i64,
+    pub stale_download_age_ns: i64,
+}
+
+impl Default for CleanupPolicy {
+    fn default() -> Self {
+        Self {
+            large_file_bytes: 100 * 1024 * 1024,
+            old_file_age_ns: 365 * DAY_NS,
+            stale_download_age_ns: 180 * DAY_NS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CleanupReason {
+    Large,
+    Old,
+    Temporary,
+    StaleDownload,
+}
+
+/// 只根据索引快照生成可解释的清理候选，不读取内容，也不执行任何文件操作。
+pub fn cleanup_reasons(
+    path: &Path,
+    size: u64,
+    modified_at_ns: i64,
+    now_ns: i64,
+    policy: CleanupPolicy,
+) -> Vec<CleanupReason> {
+    let mut reasons = Vec::new();
+    if size >= policy.large_file_bytes {
+        reasons.push(CleanupReason::Large);
+    }
+    let age_ns = now_ns.saturating_sub(modified_at_ns).max(0);
+    if age_ns >= policy.old_file_age_ns {
+        reasons.push(CleanupReason::Old);
+    }
+    let folded_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .nfkc()
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let temporary = [".tmp", ".temp", ".cache", ".log", ".bak", ".old"]
+        .iter()
+        .any(|suffix| folded_name.ends_with(suffix))
+        || folded_name.ends_with('~');
+    if temporary {
+        reasons.push(CleanupReason::Temporary);
+    }
+    let in_downloads = path.components().any(|component| {
+        component.as_os_str().to_str().is_some_and(|value| {
+            matches!(
+                value.to_lowercase().as_str(),
+                "downloads" | "download" | "下载"
+            )
+        })
+    });
+    if in_downloads && age_ns >= policy.stale_download_age_ns {
+        reasons.push(CleanupReason::StaleDownload);
+    }
+    reasons
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileCategory {
     Document,
@@ -1358,6 +1429,51 @@ mod tests {
         assert_eq!(safe_filename("  CON  ", Some("txt")), "_CON.txt");
         let existing = HashSet::from(["报告.PDF".to_owned(), "报告 (2).pdf".to_owned()]);
         assert_eq!(unique_filename("报告.pdf", &existing), "报告 (3).pdf");
+    }
+
+    #[test]
+    fn cleanup_analysis_is_explainable_and_boundary_inclusive() {
+        let now = 500 * DAY_NS;
+        let reasons = cleanup_reasons(
+            Path::new("/Users/test/Downloads/archive.tmp"),
+            100 * 1024 * 1024,
+            now - 365 * DAY_NS,
+            now,
+            CleanupPolicy::default(),
+        );
+        assert_eq!(
+            reasons,
+            vec![
+                CleanupReason::Large,
+                CleanupReason::Old,
+                CleanupReason::Temporary,
+                CleanupReason::StaleDownload,
+            ]
+        );
+
+        assert!(
+            cleanup_reasons(
+                Path::new("/Users/test/Documents/current.txt"),
+                1024,
+                now - DAY_NS,
+                now,
+                CleanupPolicy::default(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn cleanup_analysis_does_not_treat_future_timestamps_as_old() {
+        let now = 10 * DAY_NS;
+        let reasons = cleanup_reasons(
+            Path::new("/home/test/Downloads/future.txt"),
+            1024,
+            now + DAY_NS,
+            now,
+            CleanupPolicy::default(),
+        );
+        assert!(reasons.is_empty());
     }
 
     #[test]

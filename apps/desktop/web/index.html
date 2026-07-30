@@ -18,6 +18,7 @@
           </button>
           <div id="smart-folders" class="smart-folders"></div>
           <button class="nav-item" id="large-files-button" type="button" disabled><span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 15h8M8 18h5"/></svg></span>大文件</button>
+          <button class="nav-item" id="cleanup-suggestions-button" type="button" disabled><span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h16M6 16l3-3 3 2 6-7"/><path d="M15 8h3v3"/></svg></span>清理建议</button>
           <button class="nav-item" id="duplicates-button" type="button" disabled><span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></span>重复文件</button>
           <button class="nav-item" id="similar-texts-button" type="button" disabled><span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="12" r="4"/><circle cx="16" cy="12" r="4"/><path d="M10.5 9a4 4 0 0 1 0 6M13.5 9a4 4 0 0 0 0 6"/></svg></span>相似内容</button>
           <button class="nav-item" id="trash-history-button" type="button" disabled><span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6M9 10v7M15 10v7"/></svg></span>可恢复文件</button>
@@ -173,6 +174,21 @@
       </div>
       <p class="modal-note" id="similar-texts-summary">使用本地特征生成只读候选；相似不代表内容相同，不提供直接清理。</p>
       <div class="history-list" id="similar-texts-list"></div>
+    </dialog>
+
+    <dialog class="modal history-modal cleanup-modal" id="cleanup-dialog" aria-labelledby="cleanup-title">
+      <div class="modal-head">
+        <div><p class="eyebrow">LOCAL CLEANUP REVIEW</p><h2 id="cleanup-title">清理建议</h2></div>
+        <button class="icon-button" id="close-cleanup" type="button" aria-label="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      </div>
+      <p class="modal-note" id="cleanup-summary">只读取索引元数据并解释候选原因；不会自动移动或删除文件。</p>
+      <div class="cleanup-metrics" aria-label="清理建议统计">
+        <div><small>大文件</small><strong id="cleanup-large">—</strong></div>
+        <div><small>长期未修改</small><strong id="cleanup-old">—</strong></div>
+        <div><small>临时文件</small><strong id="cleanup-temporary">—</strong></div>
+        <div><small>过期下载</small><strong id="cleanup-downloads">—</strong></div>
+      </div>
+      <div class="history-list" id="cleanup-list"></div>
     </dialog>
 
     <dialog class="modal compact-modal" id="smart-folder-dialog" aria-labelledby="smart-folder-title">

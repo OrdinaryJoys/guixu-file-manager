@@ -7,10 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use guixu_analysis::{
-    DuplicateInput, DuplicateProgress, EXACT_HASH_ALGORITHM, FileCategory, RetentionInput,
-    SimilarityHashInput, TEXT_MINHASH_COMPONENTS, classify_file,
-    find_exact_duplicates_cached_controlled, find_similarity_candidates, image_hashes_from_path,
-    minhash_similarity, rank_duplicate_retention, text_minhash, text_simhash, unique_filename,
+    CleanupPolicy, CleanupReason, DuplicateInput, DuplicateProgress, EXACT_HASH_ALGORITHM,
+    FileCategory, RetentionInput, SimilarityHashInput, TEXT_MINHASH_COMPONENTS, classify_file,
+    cleanup_reasons, find_exact_duplicates_cached_controlled, find_similarity_candidates,
+    image_hashes_from_path, minhash_similarity, rank_duplicate_retention, text_minhash,
+    text_simhash, unique_filename,
 };
 use guixu_domain::{ConflictPolicy, FileOperationKind, FileSnapshot, JobStatus, RuntimeInfo};
 use guixu_indexer::{PlatformWatcher, ReconcileRequest, ScanOptions, reconcile_snapshot};
@@ -75,6 +76,31 @@ struct LibraryOverviewView {
     total_files: u64,
     total_bytes: u64,
     latest_modified_at_ns: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanupCandidateView {
+    file_id: String,
+    name: String,
+    path: String,
+    size: u64,
+    modified_at_ns: i64,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanupReportView {
+    scanned_files: u64,
+    candidate_files: u64,
+    candidate_bytes: u64,
+    large_files: u64,
+    old_files: u64,
+    temporary_files: u64,
+    stale_downloads: u64,
+    truncated: bool,
+    items: Vec<CleanupCandidateView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -568,6 +594,107 @@ fn library_overview(
         total_bytes: overview.total_bytes,
         latest_modified_at_ns: overview.latest_modified_at_ns,
     })
+}
+
+#[tauri::command]
+async fn cleanup_suggestions(
+    app: AppHandle,
+    library_id: String,
+) -> Result<CleanupReportView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let database = open_worker_database(&app)?;
+        build_cleanup_report(&database, &library_id, now_ms().saturating_mul(1_000_000))
+    })
+    .await
+    .map_err(|error| format!("清理建议后台任务异常：{error}"))?
+}
+
+fn build_cleanup_report(
+    database: &Database,
+    library_id: &str,
+    now_ns: i64,
+) -> Result<CleanupReportView, String> {
+    const MAX_ITEMS: usize = 500;
+    let policy = CleanupPolicy::default();
+    let mut cursor = None;
+    let mut report = CleanupReportView {
+        scanned_files: 0,
+        candidate_files: 0,
+        candidate_bytes: 0,
+        large_files: 0,
+        old_files: 0,
+        temporary_files: 0,
+        stale_downloads: 0,
+        truncated: false,
+        items: Vec::new(),
+    };
+    loop {
+        let page = database
+            .list_files_page(library_id, cursor.as_ref(), 500)
+            .map_err(display_error)?;
+        for file in page.items {
+            report.scanned_files = report.scanned_files.saturating_add(1);
+            let path = Path::new(&file.current_path);
+            let reasons = cleanup_reasons(path, file.size, file.modified_at_ns, now_ns, policy);
+            if reasons.is_empty() {
+                continue;
+            }
+            report.candidate_files = report.candidate_files.saturating_add(1);
+            report.candidate_bytes = report.candidate_bytes.saturating_add(file.size);
+            for reason in &reasons {
+                match reason {
+                    CleanupReason::Large => {
+                        report.large_files = report.large_files.saturating_add(1)
+                    }
+                    CleanupReason::Old => report.old_files = report.old_files.saturating_add(1),
+                    CleanupReason::Temporary => {
+                        report.temporary_files = report.temporary_files.saturating_add(1)
+                    }
+                    CleanupReason::StaleDownload => {
+                        report.stale_downloads = report.stale_downloads.saturating_add(1)
+                    }
+                }
+            }
+            if report.items.len() < MAX_ITEMS {
+                report.items.push(CleanupCandidateView {
+                    file_id: file.id,
+                    name: path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(&file.current_path)
+                        .to_owned(),
+                    path: file.current_path,
+                    size: file.size,
+                    modified_at_ns: file.modified_at_ns,
+                    reasons: reasons
+                        .into_iter()
+                        .map(|reason| match reason {
+                            CleanupReason::Large => "large",
+                            CleanupReason::Old => "old",
+                            CleanupReason::Temporary => "temporary",
+                            CleanupReason::StaleDownload => "stale_download",
+                        })
+                        .map(str::to_owned)
+                        .collect(),
+                });
+            } else {
+                report.truncated = true;
+            }
+        }
+        let Some(next) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next);
+    }
+    report.items.sort_by(|left, right| {
+        right
+            .reasons
+            .len()
+            .cmp(&left.reasons.len())
+            .then(right.size.cmp(&left.size))
+            .then(left.path.cmp(&right.path))
+    });
+    Ok(report)
 }
 
 #[tauri::command]
@@ -2759,6 +2886,7 @@ pub fn run() {
             rescan_library,
             files_page,
             library_overview,
+            cleanup_suggestions,
             preview_file,
             open_file,
             reveal_file,

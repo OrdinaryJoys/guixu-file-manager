@@ -7,3 +7,4 @@ export const artifacts = resolve(here, '.artifacts');
 export const appBinary = resolve(repository, 'target/debug/guixu-desktop');
 export const library = resolve(artifacts, 'library');
 export const screenshotPath = resolve(artifacts, 'screenshots/native-library-settings.png');
+export const cleanupScreenshotPath = resolve(artifacts, 'screenshots/native-cleanup-suggestions.png');

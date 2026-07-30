@@ -159,6 +159,17 @@ const invoke = window.__TAURI__?.core?.invoke || (async (command, args = {}) => 
   if (command === 'library_overview') return browserDemo
     ? { totalFiles: demoFiles.length, totalBytes: demoFiles.reduce((total, file) => total + file.size, 0), latestModifiedAtNs: demoModifiedAtNs }
     : { totalFiles: 0, totalBytes: 0, latestModifiedAtNs: null };
+  if (command === 'cleanup_suggestions' && browserDemo) return {
+    scannedFiles: demoFiles.length,
+    candidateFiles: 1,
+    candidateBytes: demoFiles[1].size,
+    largeFiles: 0,
+    oldFiles: 1,
+    temporaryFiles: 0,
+    staleDownloads: 0,
+    truncated: false,
+    items: [{ ...demoFiles[1], fileId: demoFiles[1].id, modifiedAtNs: demoModifiedAtNs - 400 * 86_400_000_000_000, reasons: ['old'] }],
+  };
   if (command === 'preview_file' && browserDemo) {
     const file = demoFiles.find((candidate) => candidate.id === args.fileId);
     if (!file) throw new Error('演示文件不存在');
@@ -327,6 +338,15 @@ const elements = {
   smartFolders: document.querySelector('#smart-folders'),
   settingsButton: document.querySelector('#settings-button'),
   largeFilesButton: document.querySelector('#large-files-button'),
+  cleanupSuggestionsButton: document.querySelector('#cleanup-suggestions-button'),
+  cleanupDialog: document.querySelector('#cleanup-dialog'),
+  cleanupSummary: document.querySelector('#cleanup-summary'),
+  cleanupLarge: document.querySelector('#cleanup-large'),
+  cleanupOld: document.querySelector('#cleanup-old'),
+  cleanupTemporary: document.querySelector('#cleanup-temporary'),
+  cleanupDownloads: document.querySelector('#cleanup-downloads'),
+  cleanupList: document.querySelector('#cleanup-list'),
+  closeCleanup: document.querySelector('#close-cleanup'),
   trashHistoryButton: document.querySelector('#trash-history-button'),
   overview: document.querySelector('.overview'),
   taskCenter: document.querySelector('.task-center'),
@@ -450,6 +470,7 @@ function setLibrary(library) {
   elements.duplicatesButton.disabled = !library;
   elements.similarTextsButton.disabled = !library;
   elements.largeFilesButton.disabled = !library;
+  elements.cleanupSuggestionsButton.disabled = !library;
   elements.trashHistoryButton.disabled = !library;
   state.activeSmartFolderId = null;
   state.selectedIds.clear();
@@ -1256,6 +1277,94 @@ async function confirmUndoOperation() {
   }
 }
 
+async function loadCleanupSuggestions() {
+  if (!state.library) return;
+  elements.cleanupSuggestionsButton.disabled = true;
+  elements.cleanupSummary.textContent = '正在后台读取索引元数据并生成只读建议…';
+  elements.cleanupLarge.textContent = '—';
+  elements.cleanupOld.textContent = '—';
+  elements.cleanupTemporary.textContent = '—';
+  elements.cleanupDownloads.textContent = '—';
+  elements.cleanupList.replaceChildren();
+  const loading = document.createElement('div');
+  loading.className = 'empty-state';
+  loading.textContent = '正在分析清理候选…';
+  elements.cleanupList.append(loading);
+  if (!elements.cleanupDialog.open) openModal(elements.cleanupDialog);
+  setNotice('清理建议只读取本地索引，不会自动修改文件。', 'busy');
+  try {
+    const report = await invoke('cleanup_suggestions', { libraryId: state.library.id });
+    elements.cleanupLarge.textContent = String(report.largeFiles);
+    elements.cleanupOld.textContent = String(report.oldFiles);
+    elements.cleanupTemporary.textContent = String(report.temporaryFiles);
+    elements.cleanupDownloads.textContent = String(report.staleDownloads);
+    const limitNote = report.truncated ? '；明细仅显示前 500 项' : '';
+    elements.cleanupSummary.textContent = `扫描 ${report.scannedFiles} 个文件，发现 ${report.candidateFiles} 个候选，共 ${formatBytes(report.candidateBytes)}${limitNote}。建议仅供复核，不会自动删除。`;
+    renderCleanupSuggestions(report.items);
+    setNotice(`清理建议分析完成：${report.candidateFiles} 个候选。`);
+  } catch (error) {
+    elements.cleanupSummary.textContent = `读取清理建议失败：${String(error)}`;
+    elements.cleanupList.replaceChildren();
+    setNotice(`读取清理建议失败：${String(error)}`, 'error');
+  } finally {
+    elements.cleanupSuggestionsButton.disabled = !state.library;
+  }
+}
+
+function renderCleanupSuggestions(items) {
+  elements.cleanupList.replaceChildren();
+  if (items.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-state';
+    empty.textContent = '当前规则下没有需要复核的清理候选。';
+    elements.cleanupList.append(empty);
+    return;
+  }
+  const labels = {
+    large: '大于等于 100 MiB',
+    old: '超过一年未修改',
+    temporary: '临时或缓存文件',
+    stale_download: '下载目录超过半年',
+  };
+  items.forEach((item) => {
+    const card = document.createElement('article');
+    card.className = 'history-item cleanup-item';
+    const head = document.createElement('div');
+    head.className = 'history-item-head';
+    const title = document.createElement('strong');
+    title.textContent = item.name;
+    const size = document.createElement('span');
+    size.className = 'status-pill';
+    size.textContent = formatBytes(item.size);
+    head.append(title, size);
+    const path = document.createElement('p');
+    path.textContent = item.path;
+    path.title = item.path;
+    const meta = document.createElement('div');
+    meta.className = 'cleanup-item-meta';
+    const date = document.createElement('small');
+    date.textContent = `修改于 ${formatDate(item.modifiedAtNs)}`;
+    const reasons = document.createElement('div');
+    reasons.className = 'cleanup-reasons';
+    item.reasons.forEach((reason) => {
+      const tag = document.createElement('span');
+      tag.textContent = labels[reason] || reason;
+      reasons.append(tag);
+    });
+    meta.append(date, reasons);
+    const actions = document.createElement('div');
+    actions.className = 'history-actions';
+    const reveal = document.createElement('button');
+    reveal.type = 'button';
+    reveal.className = 'quiet-button';
+    reveal.textContent = '在文件夹中显示';
+    reveal.addEventListener('click', () => revealIndexedFile(item.fileId));
+    actions.append(reveal);
+    card.append(head, path, meta, actions);
+    elements.cleanupList.append(card);
+  });
+}
+
 async function loadExactDuplicates() {
   if (!state.library) return;
   state.duplicateSelectedIds.clear();
@@ -1977,6 +2086,8 @@ elements.largeFilesButton.addEventListener('click', () => {
   setActiveNavigation(null);
   runSearch('size:>100MB');
 });
+elements.cleanupSuggestionsButton.addEventListener('click', loadCleanupSuggestions);
+elements.closeCleanup.addEventListener('click', () => closeModal(elements.cleanupDialog));
 elements.trashHistoryButton.addEventListener('click', () => loadHistory(true, 'trash'));
 elements.refreshFiles.addEventListener('click', rescanLibrary);
 elements.selectVisible.addEventListener('change', () => {

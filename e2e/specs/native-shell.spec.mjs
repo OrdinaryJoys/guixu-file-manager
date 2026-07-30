@@ -1,4 +1,4 @@
-import { screenshotPath } from '../paths.mjs';
+import { cleanupScreenshotPath, screenshotPath } from '../paths.mjs';
 import assert from 'node:assert/strict';
 
 async function read(selector, property) {
@@ -79,6 +79,14 @@ describe('归序原生窗口', () => {
     assert.equal(await browser.execute(() => document.querySelectorAll('#plan-list .plan-item').length), 1);
     await click('#cancel-plan');
     await browser.waitUntil(async () => await read('#plan-dialog', 'open') === false);
+
+    await click('#cleanup-suggestions-button');
+    await browser.waitUntil(async () => ((await read('#cleanup-summary', 'text')) || '').startsWith('扫描 4 个文件'));
+    assert.match(await read('#cleanup-summary', 'text'), /发现 1 个候选/);
+    assert.match(await read('#cleanup-list', 'text'), /notes\.json/);
+    await browser.saveScreenshot(cleanupScreenshotPath);
+    await click('#close-cleanup');
+    await browser.waitUntil(async () => await read('#cleanup-dialog', 'open') === false);
   });
 
   it('重复与相似内容后台算法回填真实报告', async () => {
