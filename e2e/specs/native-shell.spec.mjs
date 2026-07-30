@@ -13,13 +13,39 @@ async function read(selector, property) {
 }
 
 async function click(selector) {
-  return browser.execute((target) => document.querySelector(target)?.click(), selector);
+  const clicked = await browser.execute((target) => {
+    const element = document.querySelector(target);
+    if (!element) return false;
+    element.click();
+    return true;
+  }, selector);
+  assert.equal(clicked, true, `找不到可点击元素：${selector}`);
+}
+
+async function waitForAppReady() {
+  await browser.waitUntil(async () => browser.execute(() => {
+    const runtime = document.querySelector('#runtime')?.textContent?.trim();
+    return document.readyState === 'complete'
+      && document.querySelector('#search-input') !== null
+      && typeof runtime === 'string'
+      && runtime.length > 0
+      && !runtime.includes('正在连接');
+  }), {
+    timeout: 20000,
+    interval: 100,
+    timeoutMsg: '应用页面或本地核心未在 20 秒内准备完成',
+  });
 }
 
 describe('归序原生窗口', () => {
+  before(async () => {
+    await waitForAppReady();
+  });
+
   it('连接本地核心并完成真实资料库扫描', async () => {
-    await browser.waitUntil(async () => !((await read('#runtime', 'text')) || '').includes('正在连接'));
-    assert.match(await read('#runtime', 'text'), /0\.1\.0/);
+    const runtime = await read('#runtime', 'text');
+    assert.equal(typeof runtime, 'string');
+    assert.match(runtime, /0\.1\.0/);
     await browser.waitUntil(async () => await read('#library-name', 'text') === 'E2E Fixture');
     await browser.waitUntil(async () => await read('#file-count', 'text') === '4 项', { timeout: 20000 });
     assert.equal(await read('#choose-folder', 'disabled'), false);
