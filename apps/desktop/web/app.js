@@ -1881,8 +1881,10 @@ async function refreshJobs() {
       const hasSimilarityAnalysis = jobs.some((job) => ['similar_text_analysis', 'similar_image_analysis'].includes(job.kind) && ['running', 'queued', 'pause_requested', 'cancel_requested'].includes(job.status));
       setNotice(hasDuplicateAnalysis ? '后台正在分析精确重复文件，可以继续浏览和搜索。' : hasSimilarityAnalysis ? '后台正在分析相似内容，可以继续浏览和搜索。' : '后台正在建立文件索引，完成后列表会自动刷新。', 'busy');
     } else if (state.library) {
+      // 仅用户主动的 library_scan 完成才刷新列表；snapshot_reconcile 只维护
+      // 索引后台状态，不打断当前浏览/选择（避免 watcher 事件风暴反复清空选择）。
       const completed = jobs.find((job) =>
-        (job.kind === 'library_scan' || job.kind === 'snapshot_reconcile')
+        job.kind === 'library_scan'
         && job.status === 'completed');
       if (completed && completed.id !== state.lastCompletedJobId) {
         state.lastCompletedJobId = completed.id;

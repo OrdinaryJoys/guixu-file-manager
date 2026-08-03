@@ -21,10 +21,13 @@ pub struct ScanOptions {
 
 impl Default for ScanOptions {
     fn default() -> Self {
+        let mut excluded_directory_names = HashSet::new();
+        // 受控废纸篓内部由操作层管理，扫描必须排除，否则 trash 文件会被重新索引。
+        excluded_directory_names.insert(".guixu-trash".to_owned());
         Self {
             batch_size: 256,
             max_depth: None,
-            excluded_directory_names: HashSet::new(),
+            excluded_directory_names,
             max_reported_issues: 100,
         }
     }
@@ -372,6 +375,19 @@ where
         }
         Err(error) => return Err(ScanError::Io(error)),
     };
+    // 受控废纸篓内的文件由操作层管理（trash 标记 missing / 撤销恢复），
+    // watcher 对账不得重新索引其内部文件，否则会把 trash 文件重新可见并清除 missing 标记。
+    if canonical
+        .components()
+        .any(|component| component.as_os_str() == ".guixu-trash")
+    {
+        return Ok(ScanReport {
+            progress: ScanProgress::default(),
+            issues: vec![],
+            cancelled: false,
+            incomplete: false,
+        });
+    }
     let report = scan_library(
         database,
         library_id,
