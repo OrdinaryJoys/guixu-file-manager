@@ -1572,4 +1572,63 @@ mod tests {
         );
         Ok(())
     }
+    // Q4：规模重复分析端到端（tiny 100k，全部唯一内容 → 断言零假阳性组 + 计时）。
+    // 前置：node test-fixtures/generate-scale.mjs e2e/.artifacts/scale-100k 100000 20260803 tiny
+    // 运行：GUIXU_SCALE_DIR=e2e/.artifacts/scale-100k \
+    //       cargo test --release -p guixu-analysis --lib -- --ignored scale_duplicates --nocapture
+    #[test]
+    #[ignore]
+    fn scale_duplicates_zero_false_positive() {
+        let directory = std::env::var("GUIXU_SCALE_DIR").expect("GUIXU_SCALE_DIR 指向规模目录");
+        // cargo test 的 cwd 是 crate 目录，相对路径基于 workspace 根解析。
+        let directory = if std::path::Path::new(&directory).is_absolute() {
+            std::path::PathBuf::from(&directory)
+        } else {
+            std::env::current_dir()
+                .expect("current dir")
+                .join("..")
+                .join("..")
+                .join(&directory)
+        };
+        let directory = directory.as_path();
+        fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_files(&path, out);
+                } else if path.file_name().is_some_and(|n| n != "manifest.json") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        collect_files(directory, &mut paths);
+        eprintln!("SCALE_DUP inputs={}", paths.len());
+        let started = std::time::Instant::now();
+        let report = find_exact_duplicates(&paths);
+        let elapsed = started.elapsed();
+        // tiny 内容为确定性伪随机且全部唯一 → 不允许出现任何重复组（零危险误报）。
+        assert!(
+            report.groups.is_empty(),
+            "规模 fixture 内容唯一，不应产生重复组：{:?}",
+            report
+                .groups
+                .iter()
+                .map(|g| &g.paths)
+                .take(3)
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "SCALE_DUP groups={} quick={} full={} skipped={} elapsed={:?} ({:.0} files/s)",
+            report.groups.len(),
+            report.stats.quick_fingerprinted_files,
+            report.stats.fully_hashed_files,
+            report.stats.skipped_files,
+            elapsed,
+            paths.len() as f64 / elapsed.as_secs_f64()
+        );
+    }
 }

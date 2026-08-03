@@ -1,6 +1,7 @@
 // Q4 规模 fixture 生成器：固定种子、确定性输出，用于 10k/100k/1m 扫描与索引基准。
 // 用法：node test-fixtures/generate-scale.mjs <输出目录> [文件数] [种子]
 // 生成 manifest.json 记录参数，保证可复现；文件内容为确定性伪随机字节。
+import { createHash } from 'node:crypto';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
@@ -59,9 +60,14 @@ function main() {
   rmSync(outputDir, { recursive: true, force: true });
   mkdirSync(outputDir, { recursive: true });
 
-  const buffer = Buffer.allocUnsafe(8192);
   let bytesWritten = 0;
   let filesCreated = 0;
+
+  // 内容 = 基于文件名+块号的 SHA-256 派生，保证不同文件内容唯一。
+  // （SplitMix64 的 `% 256` 低 8 位周期仅 256，会导致跨文件内容段重复。）
+  function contentFor(name, block) {
+    return createHash('sha256').update(`${name}#${block}`).digest();
+  }
 
   for (let index = 0; index < count; index++) {
     // 目录深度 0-4，文件名含序号保证唯一。
@@ -76,11 +82,12 @@ function main() {
     }
     const size = randomSize(random, bucket);
     let remaining = size;
+    let block = 0;
     while (remaining > 0) {
-      const chunk = Math.min(remaining, buffer.length);
-      for (let i = 0; i < chunk; i++) buffer[i] = (random() % 256);
-      writeFileSync(path, buffer.subarray(0, chunk), { flag: 'a' });
+      const chunk = Math.min(remaining, 32);
+      writeFileSync(path, contentFor(name, block).subarray(0, chunk), { flag: 'a' });
       remaining -= chunk;
+      block += 1;
       bytesWritten += chunk;
     }
     filesCreated += 1;

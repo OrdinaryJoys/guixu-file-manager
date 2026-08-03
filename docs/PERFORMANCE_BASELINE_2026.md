@@ -57,7 +57,23 @@ GUIXU_SCALE_DIR=e2e/.artifacts/scale-10k cargo test --release -p guixu-indexer -
 
 复现命令：`GUIXU_SCALE_DIR=e2e/.artifacts/scale-100k cargo test --release -p guixu-indexer --lib -- --ignored scale_scan --nocapture`（输出 `SCALE_SCAN`/`SCALE_SEARCH`/`SCALE_PAGING` 行）。
 
-100k 搜索最差 87.9 ms，低于 200 ms 试运行预算；trigram 与 unicode61 的 16–38× 规模增长来自 FTS 索引体积与 bm25 排序，需在冻结预算前以 p50/p95 多轮复测。此数字仍不包含重复分析、真实资料库目录聚集或 UI 轮询叠加。
+100k 搜索最差 87.9 ms，低于 200 ms 试运行预算；trigram 与 unicode61 的 16–38× 规模增长来自 FTS 索引体积与 bm25 排序，需在冻结预算前以 p50/p95 多轮复测。此数字仍不包含真实资料库目录聚集或 UI 轮询叠加。
+
+## 100k 精确重复分析端到端（2026-08-03）
+
+tiny 100k（全部唯一内容）上的 `find_exact_duplicates`，release 单次运行：
+
+| 指标 | 值 |
+| --- | --- |
+| 输入文件 | 100,000 |
+| 快速指纹（跳过全量哈希） | 99,855（99.9%） |
+| 完整哈希 | 0（快速指纹已完全区分） |
+| 重复组 | **0（零危险误报）** |
+| 耗时 | 9.59 s（10.4 K files/s） |
+
+复现：`GUIXU_SCALE_DIR=e2e/.artifacts/scale-100k cargo test --release -p guixu-analysis --lib -- --ignored scale_duplicates --nocapture`。
+
+测试同时作为算法回归门：内容全部唯一的 fixture 不允许出现任何重复组。生成器曾因 SplitMix64 `% 256` 低 8 位周期（256）产生跨文件相同内容段，算法正确检出了这些真实重复；生成器已改为按文件名派生的 SHA-256 内容填充，重新生成后零重复并零假阳性。**该缺陷被算法端到端测试捕获，验证了零危险误报门禁的有效性。**
 
 ### 1M 一次性规模门禁
 
