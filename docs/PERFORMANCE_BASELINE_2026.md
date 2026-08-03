@@ -40,7 +40,24 @@ node test-fixtures/generate-scale.mjs e2e/.artifacts/scale-100k 100000 20260803 
 GUIXU_SCALE_DIR=e2e/.artifacts/scale-10k cargo test --release -p guixu-indexer --lib -- --ignored scale_scan --nocapture
 ```
 
-两种分布不完全可比（10k 含大文件、100k 全小文件），但扫描主成本是元数据遍历与 SQLite 写入；超线性来源（FTS 同步、B-tree 增长）将在下一轮以同分布 10k/100k 复测确认。此数字仍不包含搜索、重复分析或真实资料库的目录聚集。
+两种分布不完全可比（10k 含大文件、100k 全小文件），但扫描主成本是元数据遍历与 SQLite 写入。**2026-08-03 同分布复测确认**：tiny 分布 10k 扫描 1.75 s（12.9 K files/s），与混合分布几乎一致——文件大小对扫描耗时无影响，15–17× 扩展系数是真实特征（FTS 同步与 SQLite B-tree 增长），仍在 20× 试运行预算内。
+
+## 100k 端到端计时（2026-08-03）
+
+同一索引（tiny 100k 全量扫描后）上的搜索与分页计时，release 构建、单次运行：
+
+| 操作 | 10k | 100k | 预算对照（TEST_STRATEGY §6） |
+| --- | --- | --- | --- |
+| 全量扫描 | 1.82 s | 30.5 s | 无变化重扫扩展 <20×：16.8× ✅ |
+| 搜索 `报告`（2 字，LIKE 回退） | 82 µs | 523 µs | — |
+| 搜索 `2026`（trigram） | 2.3 ms | 87.9 ms | 100k 热搜索 p95 <200 ms：87.9 ms ✅ |
+| 搜索 `contract`（unicode61） | 2.6 ms | 41.8 ms | ✅ |
+| 搜索 `ext:md`（结构化过滤） | 85 µs | 126 µs | ✅ |
+| 全量分页（100/页） | 101 页 8 ms | 1001 页 104 ms | — |
+
+复现命令：`GUIXU_SCALE_DIR=e2e/.artifacts/scale-100k cargo test --release -p guixu-indexer --lib -- --ignored scale_scan --nocapture`（输出 `SCALE_SCAN`/`SCALE_SEARCH`/`SCALE_PAGING` 行）。
+
+100k 搜索最差 87.9 ms，低于 200 ms 试运行预算；trigram 与 unicode61 的 16–38× 规模增长来自 FTS 索引体积与 bm25 排序，需在冻结预算前以 p50/p95 多轮复测。此数字仍不包含重复分析、真实资料库目录聚集或 UI 轮询叠加。
 
 ### 1M 一次性规模门禁
 

@@ -713,6 +713,40 @@ mod tests {
             elapsed,
             report.progress.visited_entries as f64 / elapsed.as_secs_f64()
         );
+        // Q4：同一索引上的搜索与分页计时（生成器命名含 报告/2026/contract 等词）。
+        for (label, query) in [
+            ("search-zh", "报告"),
+            ("search-digit", "2026"),
+            ("search-latin", "contract"),
+            ("search-ext", "ext:md"),
+        ] {
+            let search_started = std::time::Instant::now();
+            let hits = database
+                .search_files("library", query, 20)
+                .expect("scale search");
+            eprintln!(
+                "SCALE_SEARCH {} hits={} elapsed={:?}",
+                label,
+                hits.len(),
+                search_started.elapsed()
+            );
+        }
+        let page_started = std::time::Instant::now();
+        let mut cursor = None;
+        let mut pages = 0_u64;
+        loop {
+            let page = database
+                .list_files_page("library", cursor.as_ref(), 100)
+                .expect("scale page");
+            pages += 1;
+            let Some(next) = page.next_cursor else { break };
+            cursor = Some(next);
+        }
+        eprintln!(
+            "SCALE_PAGING pages={} elapsed={:?}",
+            pages,
+            page_started.elapsed()
+        );
         let _ = std::fs::remove_file(&db_path);
     }
 }
