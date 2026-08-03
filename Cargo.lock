@@ -1568,6 +1568,7 @@ name = "guixu-indexer"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "criterion",
  "guixu-domain",
  "guixu-platform",
  "guixu-storage",

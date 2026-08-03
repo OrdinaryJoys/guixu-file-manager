@@ -19,7 +19,28 @@
 cargo bench -p guixu-analysis --bench similarity
 ```
 
-这些数字衡量候选索引本身，不包含文件读取、文本规范化、图片解码、SQLite I/O 或任务调度。均匀随机哈希的桶分布也不能代表相机连拍、模板文档等高聚集真实数据。下一基线必须补充 10 万真实文件端到端扫描/搜索/重复分析、1M 高聚集分布、峰值 RSS 与 p50/p95。
+这些数字衡量候选索引本身，不包含文件读取、文本规范化、图片解码、SQLite I/O 或任务调度。均匀随机哈希的桶分布也不能代表相机连拍、模板文档等高聚集真实数据。下一基线必须补充 1M 高聚集分布、峰值 RSS 与 p50/p95。
+
+## 全量扫描扩展性（2026-08-03）
+
+实现位于 `guixu-indexer::reconcile_snapshot`（含 SQLite 写入与 FTS 同步）。输入由 `test-fixtures/generate-scale.mjs` 用固定种子生成（SplitMix64 确定性伪随机）；release 构建、全新数据库（含 12 个迁移）、单次全量扫描。
+
+测试环境：macOS 15.7.7、arm64、Rust 1.85、release。10k 为混合大小分布（70% <2KiB / 20% 2-64KiB / 8% 64KiB-1MiB / 2% 1-8MiB），100k 为 tiny 分布（全部 <2KiB，磁盘受限）：
+
+| 文件数 | 目录数 | 已遍历条目 | 耗时 | 吞吐 |
+| --- | --- | --- | --- | --- |
+| 10,000 | 7,421 | 22,446 | 1.75 s | 12.8 K files/s |
+| 100,000 | 60,119 | 215,909 | 26.6 s | 8.1 K files/s |
+
+扩展性系数：10 倍文件数 → 15.2 倍耗时，低于 20 倍试运行预算。复现命令：
+
+```bash
+node test-fixtures/generate-scale.mjs e2e/.artifacts/scale-10k 10000 20260803
+node test-fixtures/generate-scale.mjs e2e/.artifacts/scale-100k 100000 20260803 tiny
+GUIXU_SCALE_DIR=e2e/.artifacts/scale-10k cargo test --release -p guixu-indexer --lib -- --ignored scale_scan --nocapture
+```
+
+两种分布不完全可比（10k 含大文件、100k 全小文件），但扫描主成本是元数据遍历与 SQLite 写入；超线性来源（FTS 同步、B-tree 增长）将在下一轮以同分布 10k/100k 复测确认。此数字仍不包含搜索、重复分析或真实资料库的目录聚集。
 
 ### 1M 一次性规模门禁
 

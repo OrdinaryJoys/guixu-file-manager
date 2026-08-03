@@ -645,4 +645,74 @@ mod tests {
             .items;
         assert_eq!(files.len(), 2);
     }
+
+    // Q4 规模扫描计时（需 GUIXU_SCALE_DIR 指向生成器输出）：
+    //   node test-fixtures/generate-scale.mjs e2e/.artifacts/scale-10k 10000
+    //   GUIXU_SCALE_DIR=e2e/.artifacts/scale-10k cargo test --release -p guixu-indexer -- --ignored scale_scan --nocapture
+    #[test]
+    #[ignore]
+    fn scale_scan_timing() {
+        let directory = std::env::var("GUIXU_SCALE_DIR").expect("GUIXU_SCALE_DIR 指向规模目录");
+        // cargo test 的 cwd 是 crate 目录，相对路径需基于 workspace 根解析。
+        let directory = if std::path::Path::new(&directory).is_absolute() {
+            directory
+        } else {
+            std::env::current_dir()
+                .expect("current dir")
+                .join("..")
+                .join("..")
+                .join(&directory)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let db_path =
+            std::env::temp_dir().join(format!("guixu-scale-{}.sqlite3", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+        let mut database = Database::open(&db_path).expect("open database");
+        database
+            .connection()
+            .execute(
+                "INSERT INTO libraries(id,name,created_at_ms,updated_at_ms) VALUES('library','规模','1',1)",
+                [],
+            )
+            .expect("library fixture");
+        let canonical = std::path::Path::new(&directory)
+            .canonicalize()
+            .expect("canonical");
+        eprintln!(
+            "SCALE_SCAN canonical={} is_dir={}",
+            canonical.display(),
+            canonical.is_dir()
+        );
+        let started = std::time::Instant::now();
+        let report = reconcile_snapshot(
+            &mut database,
+            "library",
+            &canonical,
+            1,
+            &ScanOptions::default(),
+            |_| true,
+        )
+        .expect("scale scan");
+        eprintln!(
+            "SCALE_SCAN report issues={} cancelled={} incomplete={}",
+            report.issues.len(),
+            report.cancelled,
+            report.incomplete
+        );
+        let elapsed = started.elapsed();
+        let indexed = database
+            .list_files_page("library", None, 1)
+            .expect("page")
+            .items
+            .len();
+        eprintln!(
+            "SCALE_SCAN files={} indexed={} elapsed={:?} ({:.1} files/s)",
+            report.progress.visited_entries,
+            indexed,
+            elapsed,
+            report.progress.visited_entries as f64 / elapsed.as_secs_f64()
+        );
+        let _ = std::fs::remove_file(&db_path);
+    }
 }
