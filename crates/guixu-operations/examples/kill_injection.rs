@@ -54,7 +54,7 @@ fn main() {
                     now,
                 )
                 .expect("索引 fixture");
-            let target = root.join("moved.txt");
+            let _target = root.join("moved.txt");
             let planned = plan_renames(
                 root,
                 &[guixu_operations::RenameRequest {

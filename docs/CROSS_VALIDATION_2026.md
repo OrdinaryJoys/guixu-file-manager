@@ -2,17 +2,17 @@
 
 本文把“代码已实现”“自动测试通过”和“用户在真实窗口中可用”分开记录。只有三者都有证据的能力才标为完成；研究方向或规划项不再写成当前能力。
 
-2026-08-02 已重新执行 91 项 Rust 测试、3 项前端请求竞态测试、静态质量门和 5 场景原生冒烟，结果全绿。后续新增测试的风险顺序、fixture、平台矩阵、性能预算和发布退出条件见 [完整测试与分析方案](./TEST_STRATEGY_2026.md)。
+2026-08-03 已重新执行 91 项 Rust 测试、7 项前端请求竞态测试（含错误注入语义）、进程级强杀矩阵 3/3、静态质量门和 8 场景原生 E2E（含多文件操作闭环与核心 API 注入回归断言），结果全绿；2026-08-03 实机检查修复生产启动 capabilities 缺 `core:default` 阻断。后续新增测试的风险顺序、fixture、平台矩阵、性能预算和发布退出条件见 [完整测试与分析方案](./TEST_STRATEGY_2026.md)。
 
 ## 验证分层
 
 | 层级 | 验证内容 | 当前门禁 |
 | --- | --- | --- |
 | L1 静态契约 | DOM id、设置页目标、Tauri IPC 注册、CSS 变量与结构、Web/App 唯一入口 | `node tools/verify_frontend_contract.mjs` |
-| L2 算法与数据 | 搜索、身份、迁移、任务状态机、事务、清理建议、重复与相似候选、EXIF 方向、旧设置兼容 | `cargo test --workspace`（91 项） |
+| L2 算法与数据 | 搜索、身份、迁移、任务状态机、事务、清理建议、重复与相似候选、EXIF 方向、旧设置兼容、规模扫描/搜索/重复分析 | `cargo test --workspace`（91 项）+ 规模计时（10k/100k） |
 | L3 编译质量 | 格式、全部 target/feature 的 warning、JS 语法、diff 空白 | fmt、严格 Clippy、`node --check`、`git diff --check` |
 | L4 Web 交互 | 搜索、视图切换、设置、计划、执行、历史、撤销、控制台 | 同源 Web 演示真实点击 |
-| L5 App 交互 | Tauri IPC、真实索引、系统选择器、窗口缩放、macOS 字体与 WKWebView 渲染 | debug `.app` 真实窗口点击与截图 + 5 场景嵌入式 WebDriver E2E |
+| L5 App 交互 | Tauri IPC、真实索引、系统选择器、窗口缩放、macOS 字体与 WKWebView 渲染 | debug `.app` 真实窗口点击与截图 + 8 场景嵌入式 WebDriver E2E + 强杀矩阵 |
 
 ## 功能、算法和界面矩阵
 

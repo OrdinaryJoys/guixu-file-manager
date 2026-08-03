@@ -6,13 +6,21 @@
 //   无注入点       正常执行 → completed
 //
 // 前置：cargo build -p guixu-operations --features fault-injection --example kill_injection
+// （脚本会自动执行该构建，避免 example 被无 feature 构建覆盖后注入点失效）
 // 用法：node test-fixtures/kill-matrix.mjs
 import { execSync, spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const BINARY = join(process.cwd(), 'target/debug/examples/kill_injection');
+const REPOSITORY = join(process.cwd());
+const BINARY = join(REPOSITORY, 'target/debug/examples/kill_injection');
+
+// 构建 fault-injection 版 example：后续任何无 feature 构建都会覆盖它，每次运行前重建。
+execSync('cargo build -p guixu-operations --features fault-injection --example kill_injection', {
+  cwd: REPOSITORY,
+  stdio: 'inherit',
+});
 const STAGES = ['after_intent', 'after_publish'];
 
 function run(binary, args, env = {}) {
@@ -69,7 +77,16 @@ async function main() {
     });
     // 等待子进程进入注入点（stderr 打印 KILL_EXECUTE 前是注入等待；等待 3 秒让其充分到达注入点）。
     await new Promise((resolve) => setTimeout(resolve, 3000));
-    await killChild(child).catch((error) => { results.push({ stage, ok: false, detail: error.message }); return; });
+    let killed = true;
+    await killChild(child).catch((error) => {
+      killed = false;
+      results.push({ stage, ok: false, detail: error.message });
+    });
+    if (!killed) {
+      // 注入点未命中（例如 example 被无 fault-injection 构建覆盖）：跳过 recover，避免重复记录。
+      rmSync(dir, { recursive: true, force: true });
+      continue;
+    }
     const recover = run(BINARY, [db, root, 'recover']);
 
     // after_intent：意图已落库但文件未动 → 启动审计判定未开始，收敛为 failed（文件安全，无数据风险）。
