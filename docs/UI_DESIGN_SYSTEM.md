@@ -30,11 +30,41 @@
 | 强调 | `--color-accent*` | 主按钮、选中项、运行状态 |
 | 成功 | `--color-success*` | 普通通知、完成状态 |
 | 危险 | `--color-danger*` | 失败、可恢复清理、错误 |
-| 圆角 | `--radius-control/card/panel/modal` | 控件、卡片、主面板、弹窗 |
+| 圆角 | `--radius-control/card/panel/modal`、`--radius-pill` | 控件、卡片、主面板、弹窗、胶囊 |
 
-禁止为了“看起来差不多”新增相邻的灰色、绿色或边框色。确有新语义时，先补充令牌和用途，再使用。
+### 2.1 排版（2026-08 补齐）
 
-当前 `app.css` 仍包含 59 个去重十六进制色值，其中既有 `:root` 令牌定义，也有历史组件残留。后续治理按“先识别语义、再迁移组件”进行，不能机械替换或为了数字清零破坏对比度。
+| 令牌 | 值 | 用途 |
+| --- | --- | --- |
+| `--text-caption` | 11px | 标签、表头、次要说明；全应用下限，禁止更小 |
+| `--text-body-sm` | 12px | 次按钮、元数据 |
+| `--text-body` | 13px | 主内容、标准按钮 |
+| `--text-body-lg` | 14px | 侧栏导航 |
+| `--text-title-sm` | 16px | 面板标题、设置分组标题 |
+| `--text-title` | 19px | 弹窗标题 |
+| `--text-display` | 28px | 页面主标题 h1 |
+| `--weight-regular/medium/semibold/bold` | 400/500/600/700 | 仅允许这四个字重 |
+| `--leading-tight/normal/relaxed` | 1.25/1.45/1.6 | 行高 |
+
+硬性规则：禁止 8–10px 正文字号（等宽代码预览 11px）；禁止非标准字重；**中文标题 `letter-spacing: 0`**；字体栈含 `Microsoft YaHei`、`Noto Sans CJK SC` 平台回退。
+
+### 2.2 间距（4px 基栅）
+
+`--space-1: 4px`、`--space-2: 8px`、`--space-3: 12px`、`--space-4: 16px`、`--space-5: 20px`、`--space-6: 24px`、`--space-8: 32px`。散值 padding/margin 就近归并（9→8、13→12、17→16、22→24 等）；面板级留白（toolbar 28/32）保留为布局特例并注释。
+
+### 2.3 动效
+
+`--duration-fast: 120ms`（微交互）、`--duration-normal: 180ms`（弹窗/通知/批量栏）、`--duration-slow: 260ms`（视图/容器切换，上限 300ms）；`--ease-standard`（0.2,0,0,1）、`--ease-decelerate`（0,0,0,1，进入）、`--ease-accelerate`（0.4,0,1,1，离开）、`--ease-emphasized`（0.2,0,0,1.2，仅成功/确认）。
+
+规则：只动画 `transform`/`opacity`/`filter`；进入用 decelerate、离开用 accelerate；**同时响应应用设置 `body.reduce-motion` 与系统 `prefers-reduced-motion`**；弹窗进出场含 Esc（`cancel` 事件拦截动画）。
+
+### 2.4 侧栏次级色
+
+`--color-sidebar-muted`（分区标题）、`--color-sidebar-text-soft`（导航项默认）、`--color-sidebar-text-faint`（智能文件夹默认）、`--color-sidebar-text-dim`（智能文件夹副标题）、`--color-sidebar-divider`（底部分隔线）；深色底文字对比度 ≥ 4.5:1（已按 WCAG AA 校准）。
+
+### 2.5 对比度与新增规则
+
+禁止为了“看起来差不多”新增相邻的灰色、绿色或边框色。确有新语义时，先补充令牌和用途，再使用。文字对比度 ≥ 4.5:1（WCAG AA），控件与焦点环 ≥ 3:1；`--color-text-muted` 已由 `#89938c` 校准为 `#6d7770`。
 
 ## 3. 公共组件规则
 
@@ -81,5 +111,8 @@
 2. 主页面、设置、智能文件夹、重复文件、历史和任务状态；
 3. 键盘可见焦点、禁用态、悬停态、弹窗关闭与主操作；
 4. 浏览器控制台零错误；
-5. 新增 CSS 优先使用现有令牌，不复制公共组件规则。
-6. 执行 `node tools/verify_frontend_contract.mjs` 和 `node tools/verify_docs.mjs`，并把人工窗口证据写入交叉验证矩阵。
+5. 新增 CSS 优先使用现有令牌，不复制公共组件规则；
+6. 无低于 11px 的正文字号（等宽代码预览 11px 除外）；字重仅 400/500/600/700；中文标题无负字距；
+7. 文字对比度抽测 ≥ 4.5:1（控件/焦点环 ≥ 3:1）；
+8. 交互态过渡时长/曲线来自 `--duration-*`/`--ease-*`，无散值；设置「减少动态效果」与系统 `prefers-reduced-motion` 均生效；
+9. 执行 `node tools/verify_frontend_contract.mjs` 和 `node tools/verify_docs.mjs`，并把人工窗口证据写入交叉验证矩阵。
