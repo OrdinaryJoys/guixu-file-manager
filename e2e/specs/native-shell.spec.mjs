@@ -45,6 +45,12 @@ describe('归序原生窗口', () => {
   });
 
   it('连接本地核心并完成真实资料库扫描', async () => {
+    // 防回归：核心 API 必须注入（capabilities 必须含 core:default），否则前端走 demo 分支。
+    assert.equal(
+      await browser.execute(() => Boolean(window.__TAURI__?.core?.invoke)),
+      true,
+      'window.__TAURI__.core 未注入：检查 capabilities/main.json 是否含 core:default'
+    );
     const runtime = await read('#runtime', 'text');
     assert.equal(typeof runtime, 'string');
     assert.match(runtime, /0\.1\.0/);
