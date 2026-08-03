@@ -1,3 +1,5 @@
+import { LatestRequestGate } from './request-gate.js';
+
 const inDesktopApp = Boolean(window.__TAURI__?.core?.invoke);
 const browserDemo = !inDesktopApp && new URLSearchParams(window.location.search).has('demo');
 const demoModifiedAtNs = Date.now() * 1_000_000;
@@ -309,9 +311,10 @@ const state = {
   settings: { restoreLastLibrary: true, defaultViewMode: 'list', defaultSortKey: 'name', defaultSortDirection: 'asc', pageSize: 100, refreshIntervalMs: 2000, showFullPaths: true, density: 'comfortable', showOverview: true, showTaskCenter: true, fileSizeUnit: 'binary', dateFormat: 'locale', reduceMotion: false },
   refreshTimer: null,
   refreshingJobs: false,
-  previewRequestId: 0,
-  listRequestId: 0,         // P3-H8：列表/搜索请求令牌，防竞态
 };
+
+const listRequests = new LatestRequestGate();
+const previewRequests = new LatestRequestGate();
 
 const elements = {
   runtime: document.querySelector('#runtime'),
@@ -460,6 +463,9 @@ function setNotice(message, kind = 'info') {
 }
 
 function setLibrary(library) {
+  listRequests.invalidate();
+  previewRequests.invalidate();
+  state.loading = false;
   state.library = library;
   elements.libraryName.textContent = library?.name || '我的资料库';
   elements.rootPath.textContent = library?.rootPath || '选择一个文件夹开始建立本地索引';
@@ -558,7 +564,7 @@ function extension(name) {
 }
 
 function clearPreview() {
-  state.previewRequestId += 1;
+  previewRequests.invalidate();
   state.selectedId = null;
   elements.preview.replaceChildren();
   const placeholder = document.createElement('div');
@@ -721,10 +727,11 @@ function navigateFiles(event) {
 }
 
 async function loadFiles(reset = false) {
-  if (!state.library || state.loading) return;
+  if (!state.library || (state.loading && !reset)) return;
+  const libraryId = state.library.id;
   state.loading = true;
   // P3-H8：请求令牌，防止旧响应覆盖新结果。
-  const token = ++state.listRequestId;
+  const token = listRequests.begin();
   if (reset) {
     state.nextPath = null;
     state.nextId = null;
@@ -737,29 +744,30 @@ async function loadFiles(reset = false) {
   try {
     const page = await invoke('files_page', {
       request: {
-        libraryId: state.library.id,
+        libraryId,
         afterPath: state.nextPath,
         afterId: state.nextId,
         limit: state.settings.pageSize,
       },
     });
-    if (token !== state.listRequestId) return;
+    if (!listRequests.isCurrent(token) || state.library?.id !== libraryId) return;
     state.files.push(...page.items);
     state.nextPath = page.nextPath;
     state.nextId = page.nextId;
     renderFiles();
     setNotice(`已载入 ${state.files.length} 个文件。所有索引和预览均在本机完成。`);
   } catch (error) {
-    if (token !== state.listRequestId) return;
+    if (!listRequests.isCurrent(token) || state.library?.id !== libraryId) return;
     setNotice(`读取文件索引失败：${String(error)}`, 'error');
   } finally {
-    state.loading = false;
+    if (listRequests.isCurrent(token)) state.loading = false;
   }
 }
 
 let searchTimer = null;
 async function runSearch(query, { preserveContext = false } = {}) {
   if (!state.library) return;
+  const libraryId = state.library.id;
   const normalized = query.trim();
   const selectedBefore = preserveContext ? new Set(state.selectedIds) : new Set();
   const previewBefore = preserveContext ? state.selectedId : null;
@@ -771,15 +779,17 @@ async function runSearch(query, { preserveContext = false } = {}) {
   elements.clearSearch.hidden = normalized.length === 0;
   elements.saveSearch.disabled = normalized.length === 0;
   // P3-H8：请求令牌，防止连续搜索旧响应覆盖新结果。
-  const token = ++state.listRequestId;
+  const token = listRequests.begin();
+  // 搜索已取代此前的分页加载；旧请求的 finally 不得继续持有加载锁。
+  state.loading = false;
   if (!normalized) {
     setActiveNavigation(null);
     await loadFiles(true);
     return;
   }
   try {
-    const files = await invoke('search_files', { libraryId: state.library.id, query: normalized });
-    if (token !== state.listRequestId) return;
+    const files = await invoke('search_files', { libraryId, query: normalized });
+    if (!listRequests.isCurrent(token) || state.library?.id !== libraryId) return;
     state.files = files;
     if (preserveContext) {
       const available = new Set(files.map((file) => file.id));
@@ -792,7 +802,7 @@ async function runSearch(query, { preserveContext = false } = {}) {
     renderFiles();
     setNotice(`搜索到 ${files.length} 个文件。`);
   } catch (error) {
-    if (token !== state.listRequestId) return;
+    if (!listRequests.isCurrent(token) || state.library?.id !== libraryId) return;
     setNotice(`搜索失败：${String(error)}`, 'error');
   }
 }
@@ -1571,8 +1581,8 @@ async function createDuplicateTrashPlan() {
 }
 
 async function selectFile(file) {
-  const requestId = state.previewRequestId + 1;
-  state.previewRequestId = requestId;
+  const requestId = previewRequests.begin();
+  const libraryId = state.library.id;
   // Phase 4：patch 选中态而非重建全部行。
   const oldRow = state.selectedId ? elements.fileList.querySelector(`[data-file-id="${state.selectedId}"]`) : null;
   state.selectedId = file.id;
@@ -1587,11 +1597,11 @@ async function selectFile(file) {
   loading.textContent = '正在读取安全预览…';
   elements.preview.append(loading);
   try {
-    const preview = await invoke('preview_file', { libraryId: state.library.id, fileId: file.id });
-    if (requestId !== state.previewRequestId || state.selectedId !== file.id) return;
+    const preview = await invoke('preview_file', { libraryId, fileId: file.id });
+    if (!previewRequests.isCurrent(requestId) || state.library?.id !== libraryId || state.selectedId !== file.id) return;
     renderPreview(preview);
   } catch (error) {
-    if (requestId !== state.previewRequestId || state.selectedId !== file.id) return;
+    if (!previewRequests.isCurrent(requestId) || state.library?.id !== libraryId || state.selectedId !== file.id) return;
     elements.preview.replaceChildren();
     const message = document.createElement('div');
     message.className = 'preview-placeholder';

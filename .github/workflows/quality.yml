@@ -34,7 +34,9 @@ jobs:
       - name: Frontend contracts
         run: |
           node --check apps/desktop/web/app.js
+          npm --prefix apps/desktop/web test
           node tools/verify_frontend_contract.mjs
+          node tools/verify_docs.mjs
       - name: Install native E2E dependencies
         working-directory: e2e
         run: npm ci

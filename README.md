@@ -26,7 +26,7 @@ cargo run -p guixu-desktop
 
 批量重命名、安全复制、通用移动与可恢复删除已完成“参数/原生目录选择 → 安全预检 → 计划确认 → 持久执行 → 历史 → 撤销”闭环；持久哈希缓存已接入重复分析，相似文本/图片基础 provider 已接入统一持久任务和只读 UI，阈值基准与平台增强仍在后续里程碑中。完整状态、算法方案与验收门见 [整体方案](docs/MASTER_PLAN.md)。
 
-当前里程碑和已知限制可快速查看 [开发进度](docs/DEVELOPMENT_STATUS.md)，界面组件和视觉约束见 [UI 设计系统](docs/UI_DESIGN_SYSTEM.md)，相似内容、端侧模型和混合检索选型见 [2026 算法与技术架构](docs/ALGORITHM_DESIGN_2026.md)。
+完整文档入口见 [文档中心](docs/README.md)。当前里程碑和已知限制可快速查看 [开发进度](docs/DEVELOPMENT_STATUS.md)，完整测试矩阵与发布门见 [测试与分析方案](docs/TEST_STRATEGY_2026.md)，界面组件和视觉约束见 [UI 设计系统](docs/UI_DESIGN_SYSTEM.md)，相似内容、端侧模型和混合检索选型见 [2026 算法与技术架构](docs/ALGORITHM_DESIGN_2026.md)。
 
 ## 核心安全约束
 
@@ -49,10 +49,12 @@ cargo test --workspace
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 node --check apps/desktop/web/app.js
+npm --prefix apps/desktop/web test
 node tools/verify_frontend_contract.mjs
+node tools/verify_docs.mjs
 ```
 
-截至 2026-07-30，Rust workspace 为 89 项测试通过，并已增加 Criterion/百万级相似候选基准、训练/验证分离的阈值评估工具，以及 macOS 嵌入式 WebDriver 原生资料库 E2E。浏览器演示可用 `?demo=1` 快速验证页面交互；Web 演示与 Tauri App 共享唯一的 `apps/desktop/web` 前端资源、相似内容报告契约和任务状态。原根目录 Python 页面已移入 `legacy/python-prototype`，只保留作审计基线。完整的代码、Web 和原生 App 证据见 [交叉验证矩阵](docs/CROSS_VALIDATION_2026.md)；正式签名、公证和发布仍属于后续真机验收项。
+截至 2026-08-02，Rust workspace 为 91 项测试通过，前端请求竞态单测为 3 项通过，macOS 嵌入式 WebDriver 原生资料库 E2E 为 5 项通过；同时已有 Criterion/百万级相似候选基准和训练/验证分离的阈值评估工具。浏览器演示可用 `?demo=1` 快速验证页面交互；Web 演示与 Tauri App 共享唯一的 `apps/desktop/web` 前端资源、相似内容报告契约和任务状态。原根目录 Python 页面已移入 `legacy/python-prototype`，只保留作审计基线。完整的代码、Web 和原生 App 证据见 [交叉验证矩阵](docs/CROSS_VALIDATION_2026.md)；仍未通过的规模、故障注入、平台和发布门见 [测试与分析方案](docs/TEST_STRATEGY_2026.md)。
 
 ## 旧项目合并
 

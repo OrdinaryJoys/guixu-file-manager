@@ -1,16 +1,16 @@
 # 归序 UI 抛光方案
 
-> 状态：实施跟踪稿 v3（2026-07-29）
+> 状态：实施跟踪稿 v4（2026-08-03）；Phase 0–4 基础实现完成，持续验收
 >
 > 适用范围：桌面主线 Web UI（`apps/desktop/web/`）
 >
-> 关联文档：[UI 设计系统](./UI_DESIGN_SYSTEM.md)、[MASTER_PLAN](./MASTER_PLAN.md)、[REMEDIATION_PLAN](./REMEDIATION_PLAN.md)
+> 关联文档：[UI 设计系统](./UI_DESIGN_SYSTEM.md)、[MASTER_PLAN](./MASTER_PLAN.md)、[REMEDIATION_PLAN](./REMEDIATION_PLAN_2026.md)
 >
 > 目标：解决字体/控件不统一、视觉令牌未落地、界面切换生硬缺少动效等问题，在不改变业务逻辑的前提下，按主流桌面应用标准（Apple HIG / Material 3 / Fluent 的交互通则）提升整体质感与一致性。
 >
 > v2 修订说明：对照 `app.css` / `app.js` / `index.html` 全量验证 v1 诊断数据（修正记录见第 12 节）；合并 2026-07-29 UI 专项检查的新增发现（中文字距、字体栈平台回退、task-action 规格等）；补齐主流交互模式规范（对比度门禁、间距标尺、弹窗 Esc 动画、骨架屏、确定性进度、Toast 生命周期等）。
 
-> v3 实施状态：Phase 0–3 已落地；Phase 4 已完成文件选中态局部 patch 与长列表 `content-visibility` 基础优化。弹窗进出场、通知生命周期、批量栏、任务进度、骨架屏、预览淡入、SVG 图标、双重 reduced-motion、设置分区动画及 900×620 响应式均已在真实 Tauri 窗口验证。下文“现状诊断”保留为改造前基线，不能再视为当前缺陷清单。
+> v4 实施状态：Phase 0–3 已落地；Phase 4 已完成文件选中态局部 patch、长列表 `content-visibility` 和 `LatestRequestGate` 请求失效基础。弹窗进出场、通知生命周期、批量栏、任务进度、骨架屏、预览淡入、SVG 图标、双重 reduced-motion、设置分区动画及 900×620 响应式均已在真实 Tauri 窗口验证。下文“现状诊断”和原排期保留为改造前证据，不能再视为当前缺陷或待实施清单。
 
 ---
 
@@ -86,7 +86,7 @@
 | 通知 | 常驻无生命周期；成功类消息不自动消退 |
 | 无障碍动效 | 「减少动态效果」设置已接入 `body.reduce-motion`，但几乎无内容可关；未监听 `prefers-reduced-motion` |
 
-**结论：** `reduceMotion` 基础设施（设置项 + body 类）已就绪，动效体系本身尚未建立。
+**历史结论（实施前）**：当时 `reduceMotion` 基础设施（设置项 + body 类）已就绪，但动效体系尚未建立；当前实现状态见文首 v4 摘要和第 14 节。
 
 ---
 
@@ -373,7 +373,7 @@
 
 #### 3.2 文件列表
 
-搜索/刷新/重载走容器 crossfade；**依赖 REMEDIATION_PLAN P3 的 `listRequestId` 请求令牌**（避免旧响应覆盖新结果后与动画叠加错乱），故本项排期在 P3 之后。列表↔网格 crossfade（§6.6）。加载更多 stagger（§6.6）。
+搜索/刷新/重载走容器 crossfade；当前由 REMEDIATION_PLAN P3 的 `LatestRequestGate` 保证旧响应不能覆盖新结果，并已有 3 项前端竞态单测。列表↔网格 crossfade 与加载更多 stagger 按 §6.6 验收。
 
 #### 3.3 任务中心
 
@@ -437,7 +437,7 @@ flowchart LR
 | Phase 3 | 2–3 天 | `app.css`, `app.js` | 流畅、高级 |
 | Phase 4 | 2 天 | `app.js` | 减少闪烁 |
 
-**建议优先级：** Phase 1 + Phase 2 先做（投入产出比最高，不改业务逻辑）。Phase 3 的列表动效项等 REMEDIATION_PLAN P3（请求令牌）合并后启动；Phase 3 其余项与 Phase 4 可拆独立 PR。
+**原实施优先级（已完成）**：当时按 Phase 1 + Phase 2、再 Phase 3 + Phase 4 推进；当前请求门与基础动效均已落地，本段只保留排期依据。
 
 **总预估：** 7.5–9.5 个工作日。
 
@@ -445,7 +445,7 @@ flowchart LR
 
 ## 9. 与其他方案的关系
 
-- **[REMEDIATION_PLAN](./REMEDIATION_PLAN.md)**：功能/算法缺陷修复（P0–P5）。两方案可并行；衔接点为本方案 Phase 3.2 依赖其 P3 的请求令牌，Phase 2.2 的弹窗封装不动其业务流程。
+- **[REMEDIATION_PLAN](./REMEDIATION_PLAN_2026.md)**：功能/算法缺陷修复（P0–P5）。P3 请求门已经落地，UI 内容切换与异步状态继续共用该安全边界。
 - **[UI_DESIGN_SYSTEM](./UI_DESIGN_SYSTEM.md)**：本方案第 5 节令牌落地后回写该文档，使其成为唯一令牌来源。
 
 ---
@@ -542,14 +542,13 @@ flowchart LR
 
 ---
 
-## 14. 结论
+## 14. 当前结论
 
-当前 UI 问题源于四层缺失叠加：**排版令牌缺失**（含中文字距与平台字体回退两个可读性硬伤）、**颜色/圆角/间距未落地**（含对比度不达标）、**动效体系空白**、**主流交互模式缺失**（骨架屏/进度/通知生命周期/弹窗进出场）。四者叠加时，即使静态配色正确，全量 DOM 替换仍会让界面显得生硬、不高级。
+Phase 0–4 的基础实现已经落地，原先的排版、组件、动效和全量 DOM 替换问题不再作为当前总体缺陷。后续工作转为持续验收：
 
-推荐实施路径：
+1. 清理剩余历史硬编码色并维持 WCAG 对比度门；
+2. 在 1180×760、900×620、长路径、紧凑密度和系统 reduced motion 组合下回归；
+3. 为所有弹窗补齐键盘焦点返回、错误/空/加载态和稳定截图证据；
+4. 扩展 `LatestRequestGate` 延迟/失败注入，确保动效不会掩盖异步状态错误。
 
-1. **Phase 0 + Phase 1** — 建立令牌并统一字体/图标/按钮（用户可见的最大改进）。
-2. **Phase 2** — 基础过渡与弹窗动画（低成本高质感）。
-3. **Phase 3 + Phase 4** — 内容切换、骨架屏、进度与 DOM 稳定性（体验上限；3.2 等 REMEDIATION P3 就绪后启动）。
-
-每阶段结束执行第 10 节验收清单后再进入下一阶段。
+当前 UI 完成度与阻塞项以 [开发进度](./DEVELOPMENT_STATUS.md) 为准；本方案前半部分继续作为改造依据和历史证据。
