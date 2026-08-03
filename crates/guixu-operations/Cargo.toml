@@ -14,5 +14,10 @@ blake3.workspace = true
 libc.workspace = true
 unicode-normalization.workspace = true
 
+[features]
+default = []
+# 故障注入：在持久化节点等待 kill，供 kill-matrix 进程级测试使用（仅测试构建启用）。
+fault-injection = []
+
 [dev-dependencies]
 tempfile = "3"

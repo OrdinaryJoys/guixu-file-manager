@@ -11,6 +11,20 @@ use guixu_storage::{Database, OperationItemIntent, StorageError, StoredOperation
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
+/// 故障注入点：`GUIXU_FAULT_POINT=<name>` 匹配时在此循环等待（等待测试 kill -9）。
+/// 仅在 `fault-injection` feature 下生效；生产构建为零开销空函数。
+#[cfg(feature = "fault-injection")]
+pub fn fault_point(name: &str) {
+    if std::env::var("GUIXU_FAULT_POINT").as_deref() == Ok(name) {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+#[cfg(not(feature = "fault-injection"))]
+pub fn fault_point(_name: &str) {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MoveIntent {
     pub root: PathBuf,
@@ -577,6 +591,7 @@ fn execute_stored_plan_with_hook(
     )?;
     database.update_plan_status(plan_id, "executing")?;
     database.update_operation_status(operation_id, OperationStatus::Executing, None, None)?;
+    fault_point("after_intent");
 
     let mut completed = 0;
     for (item, intent) in plan.items.iter().zip(&intents) {
@@ -615,6 +630,7 @@ fn execute_stored_plan_with_hook(
                     &outcome.target_snapshot,
                     &hex_hash(outcome.content_hash),
                 )?;
+                fault_point("after_publish");
                 if plan.operation_kind == FileOperationKind::Trash {
                     database.mark_file_missing(&plan.library_id, &item.source_path, now_ms)?;
                 } else {
