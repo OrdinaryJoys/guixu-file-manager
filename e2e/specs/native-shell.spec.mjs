@@ -258,13 +258,6 @@ describe('多文件操作闭环', () => {
     await waitForIdleJobs();
     assert.equal(await pickRows(['alpha.txt', 'beta.txt']), 2);
     await click('#organize-selected');
-    // 诊断：计划生成失败时读 notice 与按钮状态。
-    const diagnose = await browser.execute(() => ({
-      notice: document.querySelector('#notice-text')?.textContent?.trim(),
-      organizeDisabled: document.querySelector('#organize-selected')?.disabled,
-      planOpen: document.querySelector('#plan-dialog')?.hasAttribute('open'),
-    }));
-    console.log('organize diagnose:', JSON.stringify(diagnose));
     await browser.waitUntil(async () => await read('#plan-dialog', 'open') === true);
     assert.equal(await read('#plan-list', 'count'), 2);
     assert.match(await read('#plan-list', 'text'), /归序整理/);

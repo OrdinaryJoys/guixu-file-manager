@@ -45,11 +45,11 @@ for (const file of files) {
 }
 
 const currentSources = required.map((path) => readFileSync(resolve(repository, path), 'utf8')).join('\n');
-for (const marker of ['91 项', '3 项', '5 场景']) {
+for (const marker of ['91 项', '7 项', '8 场景', '3/3 通过']) {
   if (!currentSources.includes(marker)) errors.push(`当前文档缺少验证基线：${marker}`);
 }
 if (/\b89\s*(?:项|个)\s*Rust/u.test(currentSources)) {
-  errors.push('当前事实来源仍包含过期的 89 项 Rust 基线');
+  errors.push('当前事实来源仍包含过期的 89/5 项基线');
 }
 
 if (errors.length > 0) {
