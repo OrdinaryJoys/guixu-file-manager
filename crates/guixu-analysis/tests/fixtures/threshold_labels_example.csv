@@ -1,0 +1,12 @@
+# 仅验证评估管线，不代表真实产品标注集或最终门限
+split,primary_distance,secondary_similarity,is_match
+train,2,0.94,true
+train,5,0.82,true
+train,7,0.68,true
+train,3,0.20,false
+train,6,0.32,false
+train,8,0.44,false
+validation,3,0.90,true
+validation,6,0.73,true
+validation,4,0.25,false
+validation,8,0.40,false

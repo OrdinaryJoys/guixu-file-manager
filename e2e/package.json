@@ -1,0 +1,20 @@
+{
+  "name": "guixu-native-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:app": "cargo build -p guixu-desktop --features e2e",
+    "prepare:fixture": "node ./prepare-fixture.mjs",
+    "test": "npm run build:app && npm run prepare:fixture && wdio run ./wdio.conf.mjs"
+  },
+  "overrides": {
+    "@wdio/native-utils": "2.5.0"
+  },
+  "devDependencies": {
+    "@wdio/cli": "9.30.0",
+    "@wdio/local-runner": "9.30.0",
+    "@wdio/mocha-framework": "9.30.0",
+    "@wdio/spec-reporter": "9.29.1",
+    "@wdio/tauri-service": "1.2.0"
+  }
+}

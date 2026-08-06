@@ -21,10 +21,13 @@ pub struct ScanOptions {
 
 impl Default for ScanOptions {
     fn default() -> Self {
+        let mut excluded_directory_names = HashSet::new();
+        // 受控废纸篓内部由操作层管理，扫描必须排除，否则 trash 文件会被重新索引。
+        excluded_directory_names.insert(".guixu-trash".to_owned());
         Self {
             batch_size: 256,
             max_depth: None,
-            excluded_directory_names: HashSet::new(),
+            excluded_directory_names,
             max_reported_issues: 100,
         }
     }
@@ -50,6 +53,7 @@ pub struct ScanReport {
     pub progress: ScanProgress,
     pub issues: Vec<ScanIssue>,
     pub cancelled: bool,
+    pub incomplete: bool,
 }
 
 #[derive(Debug, Error)]
@@ -95,7 +99,9 @@ impl DirtyDirectorySet {
             .canonicalize()
             .unwrap_or_else(|_| directory.to_owned());
         let directory = normalized.as_path();
-        if !directory.starts_with(&self.root) {
+        if !directory.starts_with(&self.root)
+            && !directory.starts_with(self.root.parent().unwrap_or(&self.root))
+        {
             return;
         }
         if directory == self.root {
@@ -203,11 +209,12 @@ where
         return Err(ScanError::InvalidRoot(root));
     }
     let batch_size = options.batch_size.clamp(1, 2048);
-    let mut stack = vec![(fs::read_dir(&root)?, 0_usize)];
+    let mut stack = vec![(fs::read_dir(&root)?, root.clone(), 0_usize)];
     let mut batch = Vec::with_capacity(batch_size);
     let mut progress = ScanProgress::default();
     let mut issues = Vec::new();
     let mut cancelled = false;
+    let mut seen_identities: HashSet<(String, String)> = HashSet::new();
 
     while !stack.is_empty() {
         if !should_continue(&progress) {
@@ -227,7 +234,7 @@ where
                 push_issue(
                     &mut issues,
                     options.max_reported_issues,
-                    &root,
+                    &stack.last().expect("dir frame").1,
                     error.to_string(),
                 );
                 continue;
@@ -252,7 +259,7 @@ where
             continue;
         }
         if file_type.is_dir() {
-            let current_depth = stack.last().expect("directory frame").1;
+            let current_depth = stack.last().expect("dir frame").2;
             let name = entry.file_name();
             if options
                 .excluded_directory_names
@@ -265,7 +272,7 @@ where
                 continue;
             }
             match fs::read_dir(&path) {
-                Ok(directory) => stack.push((directory, current_depth + 1)),
+                Ok(directory) => stack.push((directory, path, current_depth + 1)),
                 Err(error) => {
                     progress.skipped_entries += 1;
                     push_issue(
@@ -293,12 +300,21 @@ where
             continue;
         };
         match observe_file(&path) {
-            Ok(observed) => batch.push(FileObservation {
-                new_file_id: stable_record_id(library_id, &observed.identity),
-                path: path_text.to_owned(),
-                identity: observed.identity,
-                snapshot: observed.snapshot,
-            }),
+            Ok(observed) => {
+                if !seen_identities.insert((
+                    observed.identity.volume_id.clone(),
+                    observed.identity.native_file_id.clone(),
+                )) {
+                    progress.skipped_entries += 1;
+                    continue;
+                }
+                batch.push(FileObservation {
+                    new_file_id: stable_record_id(library_id, &observed.identity),
+                    path: path_text.to_owned(),
+                    identity: observed.identity,
+                    snapshot: observed.snapshot,
+                });
+            }
             Err(error) => {
                 progress.skipped_entries += 1;
                 push_issue(
@@ -326,10 +342,12 @@ where
         &mut batch,
         &mut progress,
     )?;
+    let incomplete = !issues.is_empty();
     Ok(ScanReport {
         progress,
         issues,
         cancelled,
+        incomplete,
     })
 }
 
@@ -345,7 +363,31 @@ pub fn reconcile_snapshot<F>(
 where
     F: FnMut(&ScanProgress) -> bool,
 {
-    let canonical = directory.canonicalize()?;
+    let canonical = match directory.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ScanReport {
+                progress: ScanProgress::default(),
+                issues: vec![],
+                cancelled: false,
+                incomplete: false,
+            });
+        }
+        Err(error) => return Err(ScanError::Io(error)),
+    };
+    // 受控废纸篓内的文件由操作层管理（trash 标记 missing / 撤销恢复），
+    // watcher 对账不得重新索引其内部文件，否则会把 trash 文件重新可见并清除 missing 标记。
+    if canonical
+        .components()
+        .any(|component| component.as_os_str() == ".guixu-trash")
+    {
+        return Ok(ScanReport {
+            progress: ScanProgress::default(),
+            issues: vec![],
+            cancelled: false,
+            incomplete: false,
+        });
+    }
     let report = scan_library(
         database,
         library_id,
@@ -354,7 +396,7 @@ where
         options,
         should_continue,
     )?;
-    if !report.cancelled {
+    if !report.cancelled && !report.incomplete {
         let directory_text = canonical
             .to_str()
             .ok_or_else(|| ScanError::InvalidRoot(canonical.clone()))?;
@@ -562,5 +604,149 @@ mod tests {
                 .items
                 .is_empty()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_marks_scan_incomplete_and_preserves_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().join("root");
+        let blocked = root.join("locked");
+        fs::create_dir_all(&blocked).expect("create tree");
+        fs::write(root.join("visible.txt"), b"visible").expect("visible file");
+        fs::write(blocked.join("hidden.txt"), b"hidden").expect("hidden file");
+        let mut database = database(&directory.path().join("scan.sqlite3"));
+        reconcile_snapshot(
+            &mut database,
+            "library",
+            &root,
+            1000,
+            &ScanOptions::default(),
+            |_| true,
+        )
+        .expect("first scan");
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).expect("chmod blocked");
+        let report = reconcile_snapshot(
+            &mut database,
+            "library",
+            &root,
+            2000,
+            &ScanOptions::default(),
+            |_| true,
+        )
+        .expect("second scan");
+        assert!(report.incomplete);
+        assert!(!report.cancelled);
+        let _ = fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755));
+        let files = database
+            .list_files_page("library", None, 10)
+            .expect("list")
+            .items;
+        assert_eq!(files.len(), 2);
+    }
+
+    // Q4 规模扫描计时（需 GUIXU_SCALE_DIR 指向生成器输出）：
+    //   node test-fixtures/generate-scale.mjs e2e/.artifacts/scale-10k 10000
+    //   GUIXU_SCALE_DIR=e2e/.artifacts/scale-10k cargo test --release -p guixu-indexer -- --ignored scale_scan --nocapture
+    #[test]
+    #[ignore]
+    fn scale_scan_timing() {
+        let directory = std::env::var("GUIXU_SCALE_DIR").expect("GUIXU_SCALE_DIR 指向规模目录");
+        // cargo test 的 cwd 是 crate 目录，相对路径需基于 workspace 根解析。
+        let directory = if std::path::Path::new(&directory).is_absolute() {
+            directory
+        } else {
+            std::env::current_dir()
+                .expect("current dir")
+                .join("..")
+                .join("..")
+                .join(&directory)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let db_path =
+            std::env::temp_dir().join(format!("guixu-scale-{}.sqlite3", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+        let mut database = Database::open(&db_path).expect("open database");
+        database
+            .connection()
+            .execute(
+                "INSERT INTO libraries(id,name,created_at_ms,updated_at_ms) VALUES('library','规模','1',1)",
+                [],
+            )
+            .expect("library fixture");
+        let canonical = std::path::Path::new(&directory)
+            .canonicalize()
+            .expect("canonical");
+        eprintln!(
+            "SCALE_SCAN canonical={} is_dir={}",
+            canonical.display(),
+            canonical.is_dir()
+        );
+        let started = std::time::Instant::now();
+        let report = reconcile_snapshot(
+            &mut database,
+            "library",
+            &canonical,
+            1,
+            &ScanOptions::default(),
+            |_| true,
+        )
+        .expect("scale scan");
+        eprintln!(
+            "SCALE_SCAN report issues={} cancelled={} incomplete={}",
+            report.issues.len(),
+            report.cancelled,
+            report.incomplete
+        );
+        let elapsed = started.elapsed();
+        let indexed = database
+            .list_files_page("library", None, 1)
+            .expect("page")
+            .items
+            .len();
+        eprintln!(
+            "SCALE_SCAN files={} indexed={} elapsed={:?} ({:.1} files/s)",
+            report.progress.visited_entries,
+            indexed,
+            elapsed,
+            report.progress.visited_entries as f64 / elapsed.as_secs_f64()
+        );
+        // Q4：同一索引上的搜索与分页计时（生成器命名含 报告/2026/contract 等词）。
+        for (label, query) in [
+            ("search-zh", "报告"),
+            ("search-digit", "2026"),
+            ("search-latin", "contract"),
+            ("search-ext", "ext:md"),
+        ] {
+            let search_started = std::time::Instant::now();
+            let hits = database
+                .search_files("library", query, 20)
+                .expect("scale search");
+            eprintln!(
+                "SCALE_SEARCH {} hits={} elapsed={:?}",
+                label,
+                hits.len(),
+                search_started.elapsed()
+            );
+        }
+        let page_started = std::time::Instant::now();
+        let mut cursor = None;
+        let mut pages = 0_u64;
+        loop {
+            let page = database
+                .list_files_page("library", cursor.as_ref(), 100)
+                .expect("scale page");
+            pages += 1;
+            let Some(next) = page.next_cursor else { break };
+            cursor = Some(next);
+        }
+        eprintln!(
+            "SCALE_PAGING pages={} elapsed={:?}",
+            pages,
+            page_started.elapsed()
+        );
+        let _ = std::fs::remove_file(&db_path);
     }
 }

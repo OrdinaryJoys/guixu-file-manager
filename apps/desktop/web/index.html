@@ -12,14 +12,19 @@
       <aside class="sidebar">
         <div class="brand"><span class="brand-mark">序</span><span>归序</span></div>
         <nav aria-label="资料库导航">
-          <button class="nav-item active" id="all-files-button" type="button"><span>▦</span>全部文件</button>
+          <button class="nav-item active" id="all-files-button" type="button"><span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span>全部文件</button>
           <button class="nav-section" id="smart-folders-button" type="button" disabled>
-            <span>⌕</span><strong>智能文件夹</strong><span class="nav-add">＋</span>
+            <span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7.5h6l2 2h10v9.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="m15.5 14.5 4 4m-1.5-6a3.5 3.5 0 1 1-7 0 3.5 3.5 0 0 1 7 0z"/></svg></span><strong>智能文件夹</strong><span class="nav-add"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></span>
           </button>
           <div id="smart-folders" class="smart-folders"></div>
-          <button class="nav-item" id="duplicates-button" type="button" disabled><span>◫</span>重复文件</button>
-          <button class="nav-item" id="history-button" type="button" disabled><span>↶</span>操作历史</button>
+          <button class="nav-item" id="large-files-button" type="button" disabled><span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 15h8M8 18h5"/></svg></span>大文件</button>
+          <button class="nav-item" id="cleanup-suggestions-button" type="button" disabled><span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h16M6 16l3-3 3 2 6-7"/><path d="M15 8h3v3"/></svg></span>清理建议</button>
+          <button class="nav-item" id="duplicates-button" type="button" disabled><span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></span>重复文件</button>
+          <button class="nav-item" id="similar-texts-button" type="button" disabled><span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="12" r="4"/><circle cx="16" cy="12" r="4"/><path d="M10.5 9a4 4 0 0 1 0 6M13.5 9a4 4 0 0 0 0 6"/></svg></span>相似内容</button>
+          <button class="nav-item" id="trash-history-button" type="button" disabled><span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6M9 10v7M15 10v7"/></svg></span>可恢复文件</button>
+          <button class="nav-item" id="history-button" type="button" disabled><span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg></span>操作历史</button>
         </nav>
+        <button class="sidebar-settings" id="settings-button" type="button"><span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z"/></svg></span><span>设置</span></button>
         <div class="sidebar-foot">
           <span class="local-dot"></span>
           <div><strong>完全本地</strong><small id="runtime">正在连接核心…</small></div>
@@ -34,12 +39,12 @@
             <p class="root-path" id="root-path">选择一个文件夹开始建立本地索引</p>
           </div>
           <button class="primary-button" id="choose-folder" type="button">
-            <span>＋</span>选择文件夹
+            <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7.5h6l2 2h10v9.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 12v6M9 15h6"/></svg>选择文件夹
           </button>
         </header>
 
         <section class="notice" id="notice" aria-live="polite">
-          <span class="notice-icon">i</span>
+          <span class="notice-icon"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></svg></span>
           <span id="notice-text">不会移动或修改任何文件；首次扫描只读取文件元数据。</span>
         </section>
 
@@ -50,7 +55,7 @@
         </section>
 
         <section class="search-bar">
-          <span>⌕</span>
+          <span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg></span>
           <input id="search-input" type="search" placeholder="搜索文件；支持 ext:pdf、size:>10MB" autocomplete="off" />
           <button id="clear-search" type="button" hidden>清除</button>
           <button id="save-search" type="button" disabled>保存为智能文件夹</button>
@@ -62,8 +67,8 @@
               <div><h2>文件</h2><span id="file-count">0 项</span></div>
               <div class="panel-actions">
                 <label class="sort-control"><span>排序</span><select id="sort-files" aria-label="文件排序方式"><option value="name">名称</option><option value="size">大小</option><option value="modified">修改时间</option></select></label>
-                <button class="quiet-button compact-control" id="sort-direction" type="button" aria-label="当前升序，点击切换为降序" title="切换排序方向">↑</button>
-                <button class="quiet-button compact-control" id="view-mode" type="button" aria-label="切换为网格视图" title="切换文件视图">▦</button>
+                <button class="quiet-button compact-control" id="sort-direction" type="button" aria-label="当前升序，点击切换为降序" title="切换排序方向"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg></button>
+                <button class="quiet-button compact-control" id="view-mode" type="button" aria-label="切换为网格视图" title="切换文件视图"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></button>
                 <button class="quiet-button" id="refresh-files" type="button" disabled>重新扫描</button>
               </div>
             </div>
@@ -75,6 +80,10 @@
               <strong id="selection-count">已选择 0 项</strong>
               <span>批量操作只会作用于明确选择的文件</span>
               <button class="quiet-button" id="clear-selection" type="button">清除选择</button>
+              <button class="quiet-button" id="rename-selected" type="button" disabled>重命名</button>
+              <button class="quiet-button" id="copy-selected" type="button" disabled>复制到…</button>
+              <button class="quiet-button" id="move-selected" type="button" disabled>移动到…</button>
+              <button class="danger-button" id="trash-selected" type="button" disabled>移入废纸篓</button>
               <button class="primary-button batch-primary" id="organize-selected" type="button" disabled>整理所选</button>
             </div>
             <div class="file-list" id="file-list" role="grid" aria-label="文件列表">
@@ -89,7 +98,7 @@
 
           <aside class="preview-panel" id="preview-panel">
             <div class="preview-placeholder">
-              <span>⌕</span>
+              <span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg></span>
               <h2>文件预览</h2>
               <p>选择左侧文件查看元数据与安全文本预览。</p>
             </div>
@@ -97,7 +106,7 @@
         </section>
 
         <section class="task-center">
-          <div class="task-title"><span>⇅</span><strong>任务中心</strong><small id="task-summary">暂无任务</small></div>
+          <div class="task-title"><span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3v14m0 0-4-4m4 4 4-4M17 21V7m0 0-4 4m4-4 4 4"/></svg></span><strong>任务中心</strong><small id="task-summary">暂无任务</small></div>
           <div id="task-list" class="task-list"></div>
         </section>
       </main>
@@ -105,10 +114,10 @@
 
     <dialog class="modal" id="plan-dialog" aria-labelledby="plan-title">
       <div class="modal-head">
-        <div><p class="eyebrow">ORGANIZE PREVIEW</p><h2 id="plan-title">确认整理计划</h2></div>
-        <button class="icon-button" id="close-plan" type="button" aria-label="关闭">×</button>
+        <div><p class="eyebrow" id="plan-eyebrow">ORGANIZE PREVIEW</p><h2 id="plan-title">确认整理计划</h2></div>
+        <button class="icon-button" id="close-plan" type="button" aria-label="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
       </div>
-      <p class="modal-note">以下只是预览。点击“确认执行”后才会移动文件，且不会覆盖已有文件。</p>
+      <p class="modal-note" id="plan-note">以下只是预览。点击“确认执行”后才会移动文件，且不会覆盖已有文件。</p>
       <div class="plan-list" id="plan-list"></div>
       <div class="modal-actions">
         <button class="quiet-button" id="cancel-plan" type="button">取消</button>
@@ -116,10 +125,26 @@
       </div>
     </dialog>
 
+    <dialog class="modal" id="rename-dialog" aria-labelledby="rename-title">
+      <form id="rename-form">
+        <div class="modal-head">
+          <div><p class="eyebrow">BATCH RENAME</p><h2 id="rename-title">批量重命名</h2></div>
+          <button class="icon-button" id="close-rename" type="button" aria-label="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+        </div>
+        <p class="modal-note">只填写文件名，不填写路径。未修改的项目会跳过；下一步仍会显示完整计划供确认。</p>
+        <p class="modal-error" id="rename-error" role="alert" hidden></p>
+        <div class="rename-list" id="rename-list"></div>
+        <div class="modal-actions">
+          <button class="quiet-button" id="cancel-rename" type="button">取消</button>
+          <button class="primary-button" type="submit">生成重命名预览</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog class="modal history-modal" id="history-dialog" aria-labelledby="history-title">
       <div class="modal-head">
         <div><p class="eyebrow">OPERATION JOURNAL</p><h2 id="history-title">操作历史</h2></div>
-        <button class="icon-button" id="close-history" type="button" aria-label="关闭">×</button>
+        <button class="icon-button" id="close-history" type="button" aria-label="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
       </div>
       <div class="history-list" id="history-list"></div>
     </dialog>
@@ -127,17 +152,50 @@
     <dialog class="modal history-modal" id="duplicates-dialog" aria-labelledby="duplicates-title">
       <div class="modal-head">
         <div><p class="eyebrow">EXACT DUPLICATES</p><h2 id="duplicates-title">精确重复文件</h2></div>
-        <button class="icon-button" id="close-duplicates" type="button" aria-label="关闭">×</button>
+        <button class="icon-button" id="close-duplicates" type="button" aria-label="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
       </div>
       <p class="modal-note" id="duplicates-summary">只读分析会先按大小筛选，再进行快速指纹和完整哈希；不会删除文件。</p>
       <div class="history-list" id="duplicates-list"></div>
+      <div class="modal-actions duplicate-actions">
+        <span id="duplicate-selection-count">未选择清理文件</span>
+        <button class="quiet-button" id="clear-duplicate-selection" type="button" disabled>清除选择</button>
+        <button class="danger-button" id="trash-duplicates" type="button" disabled>移入可恢复文件</button>
+      </div>
+    </dialog>
+
+    <dialog class="modal history-modal" id="similar-texts-dialog" aria-labelledby="similar-texts-title">
+      <div class="modal-head">
+        <div><p class="eyebrow">SIMILAR CONTENT</p><h2 id="similar-texts-title">相似内容候选</h2></div>
+        <button class="icon-button" id="close-similar-texts" type="button" aria-label="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      </div>
+      <div class="similarity-tabs" role="tablist" aria-label="相似内容类型">
+        <button class="quiet-button active" id="similar-text-tab" type="button" role="tab" aria-selected="true">文本</button>
+        <button class="quiet-button" id="similar-image-tab" type="button" role="tab" aria-selected="false">图片</button>
+      </div>
+      <p class="modal-note" id="similar-texts-summary">使用本地特征生成只读候选；相似不代表内容相同，不提供直接清理。</p>
+      <div class="history-list" id="similar-texts-list"></div>
+    </dialog>
+
+    <dialog class="modal history-modal cleanup-modal" id="cleanup-dialog" aria-labelledby="cleanup-title">
+      <div class="modal-head">
+        <div><p class="eyebrow">LOCAL CLEANUP REVIEW</p><h2 id="cleanup-title">清理建议</h2></div>
+        <button class="icon-button" id="close-cleanup" type="button" aria-label="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      </div>
+      <p class="modal-note" id="cleanup-summary">只读取索引元数据并解释候选原因；不会自动移动或删除文件。</p>
+      <div class="cleanup-metrics" aria-label="清理建议统计">
+        <div><small>大文件</small><strong id="cleanup-large">—</strong></div>
+        <div><small>长期未修改</small><strong id="cleanup-old">—</strong></div>
+        <div><small>临时文件</small><strong id="cleanup-temporary">—</strong></div>
+        <div><small>过期下载</small><strong id="cleanup-downloads">—</strong></div>
+      </div>
+      <div class="history-list" id="cleanup-list"></div>
     </dialog>
 
     <dialog class="modal compact-modal" id="smart-folder-dialog" aria-labelledby="smart-folder-title">
       <form id="smart-folder-form">
         <div class="modal-head">
           <div><p class="eyebrow">SAVED SEARCH</p><h2 id="smart-folder-title">保存智能文件夹</h2></div>
-          <button class="icon-button" id="close-smart-folder" type="button" aria-label="关闭">×</button>
+          <button class="icon-button" id="close-smart-folder" type="button" aria-label="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
         </div>
         <label class="modal-field">名称<input id="smart-folder-name" maxlength="80" autocomplete="off" placeholder="例如：本月合同" required /></label>
         <label class="modal-field">搜索条件<input id="smart-folder-query" maxlength="300" autocomplete="off" placeholder="关键词 ext:pdf size:>10MB" required /></label>
@@ -152,14 +210,70 @@
     <dialog class="modal compact-modal" id="undo-dialog" aria-labelledby="undo-title">
       <div class="modal-head">
         <div><p class="eyebrow">SAFE ROLLBACK</p><h2 id="undo-title">确认撤销操作</h2></div>
-        <button class="icon-button" id="close-undo" type="button" aria-label="关闭">×</button>
+        <button class="icon-button" id="close-undo" type="button" aria-label="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
       </div>
-      <p class="modal-note">撤销前会重新验证每个目标文件的身份；如果文件已经被替换，为避免覆盖新内容，本次撤销会整体拒绝。</p>
+      <p class="modal-note">撤销前会重新验证每个目标文件的身份、快照和内容；如果文件已经被修改或替换，为避免损坏新内容，本次撤销会整体拒绝。复制操作的撤销只删除本次创建且未变化的副本。</p>
       <div class="modal-actions">
         <button class="quiet-button" id="cancel-undo" type="button">取消</button>
         <button class="primary-button" id="confirm-undo" type="button">验证并撤销</button>
       </div>
     </dialog>
-    <script src="app.js"></script>
+
+    <dialog class="modal settings-modal" id="settings-dialog" aria-labelledby="settings-title">
+      <form id="settings-form">
+        <div class="modal-head">
+          <div><p class="eyebrow">LOCAL PREFERENCES</p><h2 id="settings-title">设置</h2></div>
+          <button class="icon-button" id="close-settings" type="button" aria-label="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+        </div>
+        <div class="settings-layout">
+          <aside class="settings-nav" aria-label="设置分类" role="tablist">
+            <button class="settings-nav-button active" id="settings-tab-general" type="button" role="tab" aria-controls="settings-general" aria-selected="true" data-settings-target="settings-general">通用</button>
+            <button class="settings-nav-button" id="settings-tab-appearance" type="button" role="tab" aria-controls="settings-appearance" aria-selected="false" data-settings-target="settings-appearance">外观与显示</button>
+            <button class="settings-nav-button" id="settings-tab-performance" type="button" role="tab" aria-controls="settings-performance" aria-selected="false" data-settings-target="settings-performance">扫描与性能</button>
+            <button class="settings-nav-button" id="settings-tab-data" type="button" role="tab" aria-controls="settings-data" aria-selected="false" data-settings-target="settings-data">本地数据</button>
+          </aside>
+          <div class="settings-content">
+            <section class="settings-section" id="settings-general" role="tabpanel" aria-labelledby="settings-tab-general"><h3>通用</h3><p>控制启动后的默认行为。</p>
+              <label class="setting-row"><span><strong>恢复上次资料库</strong><small>启动时自动打开最近使用的资料库</small></span><input id="setting-restore-library" type="checkbox" /></label>
+              <label class="setting-row"><span><strong>默认文件视图</strong><small>启动后使用列表或网格</small></span><select id="setting-view"><option value="list">列表</option><option value="grid">网格</option></select></label>
+              <label class="setting-row"><span><strong>默认排序</strong><small>新打开资料库时使用的排序字段</small></span><select id="setting-sort-key"><option value="name">名称</option><option value="size">大小</option><option value="modified">修改时间</option></select></label>
+              <label class="setting-row"><span><strong>排序方向</strong><small>默认使用升序或降序</small></span><select id="setting-sort-direction"><option value="asc">升序</option><option value="desc">降序</option></select></label>
+            </section>
+            <section class="settings-section" id="settings-appearance" role="tabpanel" aria-labelledby="settings-tab-appearance"><h3>外观与显示</h3><p>调整信息密度和辅助信息。</p>
+              <label class="setting-row"><span><strong>界面密度</strong><small>紧凑模式适合较小窗口</small></span><select id="setting-density"><option value="comfortable">舒适</option><option value="compact">紧凑</option></select></label>
+              <label class="setting-row"><span><strong>文件大小单位</strong><small>二进制使用 KiB，十进制使用 KB</small></span><select id="setting-size-unit"><option value="binary">二进制</option><option value="decimal">十进制</option></select></label>
+              <label class="setting-row"><span><strong>日期格式</strong><small>本地格式或 YYYY-MM-DD</small></span><select id="setting-date-format"><option value="locale">本地格式</option><option value="iso">ISO 日期</option></select></label>
+              <label class="setting-row"><span><strong>显示完整路径</strong><small>关闭后文件列表只显示名称</small></span><input id="setting-full-paths" type="checkbox" /></label>
+              <label class="setting-row"><span><strong>显示资料库概览</strong><small>显示文件总数、大小和最近修改</small></span><input id="setting-overview" type="checkbox" /></label>
+              <label class="setting-row"><span><strong>显示任务中心</strong><small>在窗口底部显示扫描进度</small></span><input id="setting-task-center" type="checkbox" /></label>
+              <label class="setting-row"><span><strong>减少动态效果</strong><small>关闭脉冲等非必要动画</small></span><input id="setting-reduce-motion" type="checkbox" /></label>
+            </section>
+            <section class="settings-section" id="settings-performance" role="tabpanel" aria-labelledby="settings-tab-performance"><h3>扫描与性能</h3><p>平衡大资料库的刷新速度与界面开销。</p>
+              <label class="setting-row"><span><strong>每页文件数量</strong><small>数量越大，一次渲染开销越高</small></span><select id="setting-page-size"><option value="50">50</option><option value="100">100</option><option value="200">200</option></select></label>
+              <label class="setting-row"><span><strong>后台刷新频率</strong><small>检查扫描任务和文件变化</small></span><select id="setting-refresh"><option value="2000">2 秒</option><option value="5000">5 秒</option><option value="10000">10 秒</option></select></label>
+            </section>
+            <section class="settings-section" id="settings-data" role="tabpanel" aria-labelledby="settings-tab-data"><h3>本地数据</h3><p>归序不上传文件内容。索引、设置、操作历史和哈希均保存在本机。</p>
+              <div class="local-data-grid" aria-label="本地数据状态">
+                <div><small>索引文件</small><strong id="data-indexed-files">—</strong></div>
+                <div><small>索引数据量</small><strong id="data-indexed-bytes">—</strong></div>
+                <div><small>指纹缓存</small><strong id="data-cached-files">—</strong></div>
+                <div><small>完整哈希</small><strong id="data-full-hashes">—</strong></div>
+              </div>
+              <div class="settings-info">数据库位置由系统应用数据目录管理。受控废纸篓默认持续保留，不会自动永久清空。哈希缓存是可重建数据，清理不会删除任何文件。</div>
+              <div class="settings-data-actions">
+                <button class="quiet-button" id="rebuild-index" type="button">重新扫描资料库</button>
+                <button class="danger-button" id="clear-hash-cache" type="button">清理哈希缓存</button>
+              </div>
+              <p class="settings-data-message" id="settings-data-message" aria-live="polite"></p>
+            </section>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button class="quiet-button" id="cancel-settings" type="button">取消</button>
+          <button class="primary-button" type="submit">保存设置</button>
+        </div>
+      </form>
+    </dialog>
+    <script type="module" src="app.js"></script>
   </body>
 </html>

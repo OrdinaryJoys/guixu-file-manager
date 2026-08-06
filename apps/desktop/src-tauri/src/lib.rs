@@ -6,13 +6,23 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use guixu_analysis::{FileCategory, classify_file, find_exact_duplicates, unique_filename};
-use guixu_domain::{JobStatus, RuntimeInfo};
+use guixu_analysis::{
+    CleanupPolicy, CleanupReason, DuplicateInput, DuplicateProgress, EXACT_HASH_ALGORITHM,
+    FileCategory, RetentionInput, SimilarityHashInput, TEXT_MINHASH_COMPONENTS, classify_file,
+    cleanup_reasons, find_exact_duplicates_cached_controlled, find_similarity_candidates,
+    image_hashes_from_path, minhash_similarity, rank_duplicate_retention, text_minhash,
+    text_simhash, unique_filename,
+};
+use guixu_domain::{ConflictPolicy, FileOperationKind, FileSnapshot, JobStatus, RuntimeInfo};
 use guixu_indexer::{PlatformWatcher, ReconcileRequest, ScanOptions, reconcile_snapshot};
-use guixu_operations::{audit_incomplete_operations, execute_stored_plan, undo_stored_operation};
+use guixu_operations::{
+    CopyRequest, RenameRequest, audit_incomplete_operations, execute_stored_plan, plan_copies,
+    plan_renames, plan_trash, undo_stored_operation,
+};
 use guixu_platform::{FileLaunchAction, launch_file, observe_file};
 use guixu_storage::{
-    Database, FilePageCursor, IndexedFile, NewJob, NewPlanItem, StoredOperation, parse_search_query,
+    ClaimedJob, Database, FileFeature, FileHashCache, FilePageCursor, IndexedFile, NewJob, NewPlan,
+    NewPlanItem, StoredOperation, parse_search_query,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -70,6 +80,31 @@ struct LibraryOverviewView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct CleanupCandidateView {
+    file_id: String,
+    name: String,
+    path: String,
+    size: u64,
+    modified_at_ns: i64,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanupReportView {
+    scanned_files: u64,
+    candidate_files: u64,
+    candidate_bytes: u64,
+    large_files: u64,
+    old_files: u64,
+    temporary_files: u64,
+    stale_downloads: u64,
+    truncated: bool,
+    items: Vec<CleanupCandidateView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PreviewView {
     id: String,
     name: String,
@@ -101,9 +136,61 @@ struct SmartFolderView {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(default)]
+struct AppSettingsView {
+    restore_last_library: bool,
+    default_view_mode: String,
+    default_sort_key: String,
+    default_sort_direction: String,
+    page_size: usize,
+    refresh_interval_ms: u64,
+    show_full_paths: bool,
+    density: String,
+    show_overview: bool,
+    show_task_center: bool,
+    file_size_unit: String,
+    date_format: String,
+    reduce_motion: bool,
+}
+
+impl Default for AppSettingsView {
+    fn default() -> Self {
+        Self {
+            restore_last_library: true,
+            default_view_mode: "list".to_owned(),
+            default_sort_key: "name".to_owned(),
+            default_sort_direction: "asc".to_owned(),
+            page_size: 100,
+            refresh_interval_ms: 2_000,
+            show_full_paths: true,
+            density: "comfortable".to_owned(),
+            show_overview: true,
+            show_task_center: true,
+            file_size_unit: "binary".to_owned(),
+            date_format: "locale".to_owned(),
+            reduce_motion: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ScanPayload {
     library_id: String,
     root_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicatePayload {
+    library_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SimilarityPayload {
+    library_id: String,
+    content_kind: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,6 +198,20 @@ struct ScanPayload {
 struct CreatePlanRequest {
     library_id: String,
     file_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenameItemRequest {
+    file_id: String,
+    new_name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateRenamePlanRequest {
+    library_id: String,
+    items: Vec<RenameItemRequest>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +228,7 @@ struct PlanItemView {
 #[serde(rename_all = "camelCase")]
 struct PlanView {
     id: String,
+    operation_kind: String,
     expires_at_ms: i64,
     items: Vec<PlanItemView>,
 }
@@ -153,6 +255,7 @@ struct OperationItemView {
 #[serde(rename_all = "camelCase")]
 struct OperationView {
     id: String,
+    operation_kind: String,
     status: String,
     created_at_ms: i64,
     completed_at_ms: Option<i64>,
@@ -160,7 +263,7 @@ struct OperationView {
     items: Vec<OperationItemView>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DuplicateGroupView {
     id: String,
@@ -168,21 +271,157 @@ struct DuplicateGroupView {
     potential_savings: u64,
     paths: Vec<String>,
     suggested_keep: String,
+    files: Vec<DuplicateFileView>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateFileView {
+    file_id: String,
+    path: String,
+    retention_score: i32,
+    reasons: Vec<String>,
+    suggested_keep: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DuplicateReportView {
     input_files: usize,
     quick_fingerprinted_files: usize,
     fully_hashed_files: usize,
+    quick_cache_hits: usize,
+    full_cache_hits: usize,
     skipped_files: usize,
     groups: Vec<DuplicateGroupView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SimilarContentPairView {
+    left_file_id: String,
+    left_path: String,
+    right_file_id: String,
+    right_path: String,
+    hamming_distance: u32,
+    secondary_distance: Option<u32>,
+    secondary_similarity: f32,
+    similarity: f32,
+    verification: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SimilarContentReportView {
+    content_kind: String,
+    input_files: usize,
+    computed_features: usize,
+    cache_hits: usize,
+    skipped_files: usize,
+    candidate_pairs: usize,
+    secondary_verified_pairs: usize,
+    feature_ms: u64,
+    candidate_ms: u64,
+    algorithm_profile: String,
+    pairs: Vec<SimilarContentPairView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalDataStatusView {
+    indexed_files: u64,
+    indexed_bytes: u64,
+    cached_files: u64,
+    fully_hashed_files: u64,
 }
 
 #[tauri::command]
 fn runtime_info() -> RuntimeInfo {
     RuntimeInfo::current()
+}
+
+#[tauri::command]
+fn app_settings(state: State<'_, DesktopState>) -> Result<AppSettingsView, String> {
+    let database = lock_database(&state)?;
+    let Some(json) = database.app_setting("desktop").map_err(display_error)? else {
+        return Ok(AppSettingsView::default());
+    };
+    serde_json::from_str(&json).map_err(display_error)
+}
+
+#[tauri::command]
+fn save_app_settings(
+    state: State<'_, DesktopState>,
+    settings: AppSettingsView,
+) -> Result<AppSettingsView, String> {
+    if !matches!(settings.default_view_mode.as_str(), "list" | "grid") {
+        return Err("默认视图只能是列表或网格".to_owned());
+    }
+    if !matches!(
+        settings.default_sort_key.as_str(),
+        "name" | "size" | "modified"
+    ) {
+        return Err("默认排序字段无效".to_owned());
+    }
+    if !matches!(settings.default_sort_direction.as_str(), "asc" | "desc") {
+        return Err("默认排序方向无效".to_owned());
+    }
+    if !matches!(settings.page_size, 50 | 100 | 200) {
+        return Err("分页数量只能是 50、100 或 200".to_owned());
+    }
+    if !matches!(settings.refresh_interval_ms, 2_000 | 5_000 | 10_000) {
+        return Err("刷新频率只能是 2、5 或 10 秒".to_owned());
+    }
+    if !matches!(settings.density.as_str(), "comfortable" | "compact") {
+        return Err("界面密度无效".to_owned());
+    }
+    if !matches!(settings.file_size_unit.as_str(), "binary" | "decimal") {
+        return Err("文件大小单位无效".to_owned());
+    }
+    if !matches!(settings.date_format.as_str(), "locale" | "iso") {
+        return Err("日期格式无效".to_owned());
+    }
+    let json = serde_json::to_string(&settings).map_err(display_error)?;
+    lock_database(&state)?
+        .save_app_setting("desktop", &json, now_ms())
+        .map_err(display_error)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn local_data_status(
+    state: State<'_, DesktopState>,
+    library_id: String,
+) -> Result<LocalDataStatusView, String> {
+    let database = lock_database(&state)?;
+    database
+        .library_root(&library_id)
+        .map_err(display_error)?
+        .ok_or_else(|| "资料库不存在或未授权".to_owned())?;
+    let overview = database
+        .library_overview(&library_id)
+        .map_err(display_error)?;
+    let hashes = database
+        .hash_cache_overview(&library_id, EXACT_HASH_ALGORITHM)
+        .map_err(display_error)?;
+    Ok(LocalDataStatusView {
+        indexed_files: overview.total_files,
+        indexed_bytes: overview.total_bytes,
+        cached_files: hashes.cached_files,
+        fully_hashed_files: hashes.fully_hashed_files,
+    })
+}
+
+#[tauri::command]
+fn clear_hash_cache(state: State<'_, DesktopState>, library_id: String) -> Result<usize, String> {
+    let database = lock_database(&state)?;
+    database
+        .library_root(&library_id)
+        .map_err(display_error)?
+        .ok_or_else(|| "资料库不存在或未授权".to_owned())?;
+    database
+        .clear_hash_cache(&library_id)
+        .map_err(display_error)
 }
 
 #[tauri::command]
@@ -224,9 +463,11 @@ async fn select_library_folder(app: AppHandle) -> Result<Option<LibraryView>, St
         .and_then(|name| name.to_str())
         .unwrap_or("文件资料库")
         .to_owned();
-    let record = {
+    // 先确认平台监听器可建立，避免注册资料库后留下永远 queued 的扫描任务。
+    let watcher = PlatformWatcher::start(&canonical).map_err(display_error)?;
+    let (record, scan_job_id) = {
         let state = app.state::<DesktopState>();
-        let database = lock_database(&state)?;
+        let mut database = lock_database(&state)?;
         let record = database
             .register_library_root(&library_id, &root_id, &name, &root_path, timestamp)
             .map_err(display_error)?;
@@ -235,8 +476,8 @@ async fn select_library_folder(app: AppHandle) -> Result<Option<LibraryView>, St
             root_path: record.root_path.clone(),
         })
         .map_err(display_error)?;
-        database
-            .enqueue_job(&NewJob {
+        let scan_job_id = database
+            .enqueue_or_reuse_job(&NewJob {
                 id: scan_job_id.clone(),
                 kind: "library_scan".to_owned(),
                 payload_json: payload,
@@ -245,12 +486,10 @@ async fn select_library_folder(app: AppHandle) -> Result<Option<LibraryView>, St
                 created_at_ms: timestamp,
             })
             .map_err(display_error)?;
-        record
+        (record, scan_job_id)
     };
     {
         let state = app.state::<DesktopState>();
-        let watcher =
-            PlatformWatcher::start(Path::new(&record.root_path)).map_err(display_error)?;
         state
             .watchers
             .lock()
@@ -258,7 +497,7 @@ async fn select_library_folder(app: AppHandle) -> Result<Option<LibraryView>, St
             .insert(record.library_id.clone(), watcher);
     }
     let worker_app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || run_one_scan_job(worker_app));
+    tauri::async_runtime::spawn_blocking(move || run_one_job(worker_app));
     Ok(Some(LibraryView {
         id: record.library_id,
         name: record.name,
@@ -270,10 +509,10 @@ async fn select_library_folder(app: AppHandle) -> Result<Option<LibraryView>, St
 #[tauri::command]
 fn rescan_library(app: AppHandle, library_id: String) -> Result<String, String> {
     let timestamp = now_ms();
-    let job_id = unique_id("scan", timestamp);
+    let mut job_id = unique_id("scan", timestamp);
     {
         let state = app.state::<DesktopState>();
-        let database = lock_database(&state)?;
+        let mut database = lock_database(&state)?;
         let root = database
             .library_root(&library_id)
             .map_err(display_error)?
@@ -283,8 +522,8 @@ fn rescan_library(app: AppHandle, library_id: String) -> Result<String, String> 
             root_path: root.root_path,
         })
         .map_err(display_error)?;
-        database
-            .enqueue_job(&NewJob {
+        job_id = database
+            .enqueue_or_reuse_job(&NewJob {
                 id: job_id.clone(),
                 kind: "library_scan".to_owned(),
                 payload_json: payload,
@@ -295,7 +534,7 @@ fn rescan_library(app: AppHandle, library_id: String) -> Result<String, String> 
             .map_err(display_error)?;
     }
     let worker_app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || run_one_scan_job(worker_app));
+    tauri::async_runtime::spawn_blocking(move || run_one_job(worker_app));
     Ok(job_id)
 }
 
@@ -313,7 +552,7 @@ fn files_page(
         .list_files_page(
             &request.library_id,
             cursor.as_ref(),
-            request.limit.unwrap_or(100),
+            request.limit.unwrap_or(100).clamp(1, 500),
         )
         .map_err(display_error)?;
     let (next_path, next_id) = page
@@ -355,6 +594,107 @@ fn library_overview(
         total_bytes: overview.total_bytes,
         latest_modified_at_ns: overview.latest_modified_at_ns,
     })
+}
+
+#[tauri::command]
+async fn cleanup_suggestions(
+    app: AppHandle,
+    library_id: String,
+) -> Result<CleanupReportView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let database = open_worker_database(&app)?;
+        build_cleanup_report(&database, &library_id, now_ms().saturating_mul(1_000_000))
+    })
+    .await
+    .map_err(|error| format!("清理建议后台任务异常：{error}"))?
+}
+
+fn build_cleanup_report(
+    database: &Database,
+    library_id: &str,
+    now_ns: i64,
+) -> Result<CleanupReportView, String> {
+    const MAX_ITEMS: usize = 500;
+    let policy = CleanupPolicy::default();
+    let mut cursor = None;
+    let mut report = CleanupReportView {
+        scanned_files: 0,
+        candidate_files: 0,
+        candidate_bytes: 0,
+        large_files: 0,
+        old_files: 0,
+        temporary_files: 0,
+        stale_downloads: 0,
+        truncated: false,
+        items: Vec::new(),
+    };
+    loop {
+        let page = database
+            .list_files_page(library_id, cursor.as_ref(), 500)
+            .map_err(display_error)?;
+        for file in page.items {
+            report.scanned_files = report.scanned_files.saturating_add(1);
+            let path = Path::new(&file.current_path);
+            let reasons = cleanup_reasons(path, file.size, file.modified_at_ns, now_ns, policy);
+            if reasons.is_empty() {
+                continue;
+            }
+            report.candidate_files = report.candidate_files.saturating_add(1);
+            report.candidate_bytes = report.candidate_bytes.saturating_add(file.size);
+            for reason in &reasons {
+                match reason {
+                    CleanupReason::Large => {
+                        report.large_files = report.large_files.saturating_add(1)
+                    }
+                    CleanupReason::Old => report.old_files = report.old_files.saturating_add(1),
+                    CleanupReason::Temporary => {
+                        report.temporary_files = report.temporary_files.saturating_add(1)
+                    }
+                    CleanupReason::StaleDownload => {
+                        report.stale_downloads = report.stale_downloads.saturating_add(1)
+                    }
+                }
+            }
+            if report.items.len() < MAX_ITEMS {
+                report.items.push(CleanupCandidateView {
+                    file_id: file.id,
+                    name: path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(&file.current_path)
+                        .to_owned(),
+                    path: file.current_path,
+                    size: file.size,
+                    modified_at_ns: file.modified_at_ns,
+                    reasons: reasons
+                        .into_iter()
+                        .map(|reason| match reason {
+                            CleanupReason::Large => "large",
+                            CleanupReason::Old => "old",
+                            CleanupReason::Temporary => "temporary",
+                            CleanupReason::StaleDownload => "stale_download",
+                        })
+                        .map(str::to_owned)
+                        .collect(),
+                });
+            } else {
+                report.truncated = true;
+            }
+        }
+        let Some(next) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next);
+    }
+    report.items.sort_by(|left, right| {
+        right
+            .reasons
+            .len()
+            .cmp(&left.reasons.len())
+            .then(right.size.cmp(&left.size))
+            .then(left.path.cmp(&right.path))
+    });
+    Ok(report)
 }
 
 #[tauri::command]
@@ -535,7 +875,7 @@ fn resume_job(app: AppHandle, job_id: String) -> Result<(), String> {
             .map_err(display_error)?;
     }
     let worker_app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || run_one_scan_job(worker_app));
+    tauri::async_runtime::spawn_blocking(move || run_one_job(worker_app));
     Ok(())
 }
 
@@ -729,16 +1069,306 @@ fn create_organize_plan(
     let expires_at_ms = timestamp.saturating_add(15 * 60 * 1_000);
     let plan_id = unique_id("plan", timestamp);
     database
-        .create_plan(
-            &plan_id,
-            &request.library_id,
-            timestamp,
+        .create_plan(NewPlan {
+            id: &plan_id,
+            library_id: &request.library_id,
+            operation_kind: FileOperationKind::Organize,
+            conflict_policy: ConflictPolicy::Abort,
+            created_at_ms: timestamp,
             expires_at_ms,
-            &stored_items,
-        )
+            items: &stored_items,
+        })
         .map_err(display_error)?;
     Ok(PlanView {
         id: plan_id,
+        operation_kind: FileOperationKind::Organize.as_str().to_owned(),
+        expires_at_ms,
+        items: view_items,
+    })
+}
+
+#[tauri::command]
+fn create_rename_plan(
+    state: State<'_, DesktopState>,
+    request: CreateRenamePlanRequest,
+) -> Result<PlanView, String> {
+    if request.items.is_empty() {
+        return Err("请先选择至少一个文件".to_owned());
+    }
+    if request.items.len() > 500 {
+        return Err("单次最多重命名 500 个文件".to_owned());
+    }
+    let database = lock_database(&state)?;
+    let library = database
+        .library_root(&request.library_id)
+        .map_err(display_error)?
+        .ok_or_else(|| "资料库不存在或未授权".to_owned())?;
+    let root = PathBuf::from(&library.root_path)
+        .canonicalize()
+        .map_err(display_error)?;
+    let mut seen_ids = HashSet::with_capacity(request.items.len());
+    let mut rename_requests = Vec::with_capacity(request.items.len());
+    for item in request.items {
+        if !seen_ids.insert(item.file_id.clone()) {
+            return Err(format!("重命名请求包含重复文件：{}", item.file_id));
+        }
+        let indexed = database
+            .indexed_file(&request.library_id, &item.file_id)
+            .map_err(display_error)?
+            .ok_or_else(|| format!("文件已不在当前索引中：{}", item.file_id))?;
+        let source = validate_authorized_path(&root, Path::new(&indexed.current_path))?;
+        let observed = observe_file(&source).map_err(display_error)?;
+        rename_requests.push(RenameRequest {
+            file_id: indexed.id,
+            source,
+            new_name: item.new_name,
+            expected_identity: observed.identity,
+            expected_snapshot: observed.snapshot,
+        });
+    }
+    let planned = plan_renames(&root, &rename_requests).map_err(display_error)?;
+    let stored_items = planned
+        .iter()
+        .enumerate()
+        .map(|(ordinal, item)| {
+            Ok(NewPlanItem {
+                ordinal: i64::try_from(ordinal).map_err(display_error)?,
+                file_id: item.file_id.clone(),
+                source_path: item.source.to_string_lossy().into_owned(),
+                target_path: item.target.to_string_lossy().into_owned(),
+                expected_identity: item.expected_identity.clone(),
+                expected_snapshot: item.expected_snapshot.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let view_items = stored_items
+        .iter()
+        .map(|item| PlanItemView {
+            ordinal: item.ordinal,
+            file_id: item.file_id.clone(),
+            source_path: item.source_path.clone(),
+            target_path: item.target_path.clone(),
+            category: "重命名".to_owned(),
+        })
+        .collect();
+    let timestamp = now_ms();
+    let expires_at_ms = timestamp.saturating_add(15 * 60 * 1_000);
+    let plan_id = unique_id("rename-plan", timestamp);
+    database
+        .create_plan(NewPlan {
+            id: &plan_id,
+            library_id: &request.library_id,
+            operation_kind: FileOperationKind::Rename,
+            conflict_policy: ConflictPolicy::Abort,
+            created_at_ms: timestamp,
+            expires_at_ms,
+            items: &stored_items,
+        })
+        .map_err(display_error)?;
+    Ok(PlanView {
+        id: plan_id,
+        operation_kind: FileOperationKind::Rename.as_str().to_owned(),
+        expires_at_ms,
+        items: view_items,
+    })
+}
+
+#[tauri::command]
+fn create_copy_plan(
+    app: AppHandle,
+    request: CreatePlanRequest,
+) -> Result<Option<PlanView>, String> {
+    create_destination_plan(app, request, FileOperationKind::Copy)
+}
+
+#[tauri::command]
+fn create_move_plan(
+    app: AppHandle,
+    request: CreatePlanRequest,
+) -> Result<Option<PlanView>, String> {
+    create_destination_plan(app, request, FileOperationKind::Move)
+}
+
+fn create_destination_plan(
+    app: AppHandle,
+    request: CreatePlanRequest,
+    operation_kind: FileOperationKind,
+) -> Result<Option<PlanView>, String> {
+    let action = if operation_kind == FileOperationKind::Copy {
+        "复制"
+    } else {
+        "移动"
+    };
+    if request.file_ids.is_empty() {
+        return Err("请先选择至少一个文件".to_owned());
+    }
+    if request.file_ids.len() > 500 {
+        return Err(format!("单次最多{action} 500 个文件"));
+    }
+    // 目标只来自系统文件夹选择器，页面不接收也不拼接任意路径。
+    let Some(selected) = app.dialog().file().blocking_pick_folder() else {
+        return Ok(None);
+    };
+    let destination = selected.into_path().map_err(|error| error.to_string())?;
+    let state = app.state::<DesktopState>();
+    let database = lock_database(&state)?;
+    let library = database
+        .library_root(&request.library_id)
+        .map_err(display_error)?
+        .ok_or_else(|| "资料库不存在或未授权".to_owned())?;
+    let root = PathBuf::from(&library.root_path)
+        .canonicalize()
+        .map_err(display_error)?;
+    let mut seen_ids = HashSet::with_capacity(request.file_ids.len());
+    let mut copy_requests = Vec::with_capacity(request.file_ids.len());
+    for file_id in request.file_ids {
+        if !seen_ids.insert(file_id.clone()) {
+            return Err(format!("{action}请求包含重复文件：{file_id}"));
+        }
+        let indexed = database
+            .indexed_file(&request.library_id, &file_id)
+            .map_err(display_error)?
+            .ok_or_else(|| format!("文件已不在当前索引中：{file_id}"))?;
+        let source = validate_authorized_path(&root, Path::new(&indexed.current_path))?;
+        let observed = observe_file(&source).map_err(display_error)?;
+        copy_requests.push(CopyRequest {
+            file_id: indexed.id,
+            source,
+            expected_identity: observed.identity,
+            expected_snapshot: observed.snapshot,
+        });
+    }
+    let planned = plan_copies(&root, &destination, &copy_requests).map_err(display_error)?;
+    let stored_items = planned
+        .iter()
+        .enumerate()
+        .map(|(ordinal, item)| {
+            Ok(NewPlanItem {
+                ordinal: i64::try_from(ordinal).map_err(display_error)?,
+                file_id: item.file_id.clone(),
+                source_path: item.source.to_string_lossy().into_owned(),
+                target_path: item.target.to_string_lossy().into_owned(),
+                expected_identity: item.expected_identity.clone(),
+                expected_snapshot: item.expected_snapshot.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let view_items = stored_items
+        .iter()
+        .map(|item| PlanItemView {
+            ordinal: item.ordinal,
+            file_id: item.file_id.clone(),
+            source_path: item.source_path.clone(),
+            target_path: item.target_path.clone(),
+            category: if operation_kind == FileOperationKind::Copy {
+                "安全复制".to_owned()
+            } else {
+                "安全移动".to_owned()
+            },
+        })
+        .collect();
+    let timestamp = now_ms();
+    let expires_at_ms = timestamp.saturating_add(15 * 60 * 1_000);
+    let plan_id = unique_id(&format!("{}-plan", operation_kind.as_str()), timestamp);
+    database
+        .create_plan(NewPlan {
+            id: &plan_id,
+            library_id: &request.library_id,
+            operation_kind,
+            conflict_policy: ConflictPolicy::Abort,
+            created_at_ms: timestamp,
+            expires_at_ms,
+            items: &stored_items,
+        })
+        .map_err(display_error)?;
+    Ok(Some(PlanView {
+        id: plan_id,
+        operation_kind: operation_kind.as_str().to_owned(),
+        expires_at_ms,
+        items: view_items,
+    }))
+}
+
+#[tauri::command]
+fn create_trash_plan(
+    state: State<'_, DesktopState>,
+    request: CreatePlanRequest,
+) -> Result<PlanView, String> {
+    if request.file_ids.is_empty() {
+        return Err("请先选择至少一个文件".to_owned());
+    }
+    if request.file_ids.len() > 500 {
+        return Err("单次最多移入废纸篓 500 个文件".to_owned());
+    }
+    let database = lock_database(&state)?;
+    let library = database
+        .library_root(&request.library_id)
+        .map_err(display_error)?
+        .ok_or_else(|| "资料库不存在或未授权".to_owned())?;
+    let root = PathBuf::from(&library.root_path)
+        .canonicalize()
+        .map_err(display_error)?;
+    let mut seen_ids = HashSet::with_capacity(request.file_ids.len());
+    let mut trash_requests = Vec::with_capacity(request.file_ids.len());
+    for file_id in request.file_ids {
+        if !seen_ids.insert(file_id.clone()) {
+            return Err(format!("废纸篓请求包含重复文件：{file_id}"));
+        }
+        let indexed = database
+            .indexed_file(&request.library_id, &file_id)
+            .map_err(display_error)?
+            .ok_or_else(|| format!("文件已不在当前索引中：{file_id}"))?;
+        let source = validate_authorized_path(&root, Path::new(&indexed.current_path))?;
+        let observed = observe_file(&source).map_err(display_error)?;
+        trash_requests.push(CopyRequest {
+            file_id: indexed.id,
+            source,
+            expected_identity: observed.identity,
+            expected_snapshot: observed.snapshot,
+        });
+    }
+    let timestamp = now_ms();
+    let plan_id = unique_id("trash-plan", timestamp);
+    let planned = plan_trash(&root, &plan_id, &trash_requests).map_err(display_error)?;
+    let stored_items = planned
+        .iter()
+        .enumerate()
+        .map(|(ordinal, item)| {
+            Ok(NewPlanItem {
+                ordinal: i64::try_from(ordinal).map_err(display_error)?,
+                file_id: item.file_id.clone(),
+                source_path: item.source.to_string_lossy().into_owned(),
+                target_path: item.target.to_string_lossy().into_owned(),
+                expected_identity: item.expected_identity.clone(),
+                expected_snapshot: item.expected_snapshot.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let view_items = stored_items
+        .iter()
+        .map(|item| PlanItemView {
+            ordinal: item.ordinal,
+            file_id: item.file_id.clone(),
+            source_path: item.source_path.clone(),
+            target_path: item.target_path.clone(),
+            category: "可恢复删除".to_owned(),
+        })
+        .collect();
+    let expires_at_ms = timestamp.saturating_add(15 * 60 * 1_000);
+    database
+        .create_plan(NewPlan {
+            id: &plan_id,
+            library_id: &request.library_id,
+            operation_kind: FileOperationKind::Trash,
+            conflict_policy: ConflictPolicy::Abort,
+            created_at_ms: timestamp,
+            expires_at_ms,
+            items: &stored_items,
+        })
+        .map_err(display_error)?;
+    Ok(PlanView {
+        id: plan_id,
+        operation_kind: FileOperationKind::Trash.as_str().to_owned(),
         expires_at_ms,
         items: view_items,
     })
@@ -746,6 +1376,34 @@ fn create_organize_plan(
 
 #[tauri::command]
 async fn execute_organize_plan(app: AppHandle, plan_id: String) -> Result<ExecutionView, String> {
+    execute_file_plan(app, plan_id, FileOperationKind::Organize).await
+}
+
+#[tauri::command]
+async fn execute_rename_plan(app: AppHandle, plan_id: String) -> Result<ExecutionView, String> {
+    execute_file_plan(app, plan_id, FileOperationKind::Rename).await
+}
+
+#[tauri::command]
+async fn execute_copy_plan(app: AppHandle, plan_id: String) -> Result<ExecutionView, String> {
+    execute_file_plan(app, plan_id, FileOperationKind::Copy).await
+}
+
+#[tauri::command]
+async fn execute_move_plan(app: AppHandle, plan_id: String) -> Result<ExecutionView, String> {
+    execute_file_plan(app, plan_id, FileOperationKind::Move).await
+}
+
+#[tauri::command]
+async fn execute_trash_plan(app: AppHandle, plan_id: String) -> Result<ExecutionView, String> {
+    execute_file_plan(app, plan_id, FileOperationKind::Trash).await
+}
+
+async fn execute_file_plan(
+    app: AppHandle,
+    plan_id: String,
+    expected_kind: FileOperationKind,
+) -> Result<ExecutionView, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let timestamp = now_ms();
         let operation_id = unique_id("operation", timestamp);
@@ -753,7 +1411,8 @@ async fn execute_organize_plan(app: AppHandle, plan_id: String) -> Result<Execut
         let plan = database
             .plan(&plan_id)
             .map_err(display_error)?
-            .ok_or_else(|| "整理计划不存在".to_owned())?;
+            .ok_or_else(|| "文件操作计划不存在".to_owned())?;
+        ensure_plan_kind(plan.operation_kind, expected_kind)?;
         let root = database
             .library_root(&plan.library_id)
             .map_err(display_error)?
@@ -776,6 +1435,18 @@ async fn execute_organize_plan(app: AppHandle, plan_id: String) -> Result<Execut
     .map_err(display_error)?
 }
 
+fn ensure_plan_kind(actual: FileOperationKind, expected: FileOperationKind) -> Result<(), String> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "计划类型不匹配：期望 {}，实际 {}",
+            expected.as_str(),
+            actual.as_str()
+        ))
+    }
+}
+
 #[tauri::command]
 fn operation_history(
     state: State<'_, DesktopState>,
@@ -788,74 +1459,649 @@ fn operation_history(
         .map_err(display_error)
 }
 
+const TEXT_SIMHASH_VERSION: &str = "text-simhash-char3-v1";
+const TEXT_MINHASH_VERSION: &str = "text-minhash-char5x32-v1";
+const IMAGE_DHASH_VERSION: &str = "image-dhash-gray9x8-v1";
+const IMAGE_PHASH_VERSION: &str = "image-phash-dct32x32-low8-v1";
+
+fn u64_feature(feature: Option<FileFeature>) -> Option<u64> {
+    let bytes = feature?.feature_blob;
+    (bytes.len() == 8)
+        .then(|| u64::from_le_bytes(bytes.as_slice().try_into().expect("validated eight bytes")))
+}
+
+fn minhash_feature(feature: Option<FileFeature>) -> Option<[u64; TEXT_MINHASH_COMPONENTS]> {
+    let bytes = feature?.feature_blob;
+    if bytes.len() != TEXT_MINHASH_COMPONENTS * 8 {
+        return None;
+    }
+    Some(std::array::from_fn(|index| {
+        let offset = index * 8;
+        u64::from_le_bytes(
+            bytes[offset..offset + 8]
+                .try_into()
+                .expect("eight-byte component"),
+        )
+    }))
+}
+
+fn minhash_blob(signature: &[u64; TEXT_MINHASH_COMPONENTS]) -> Vec<u8> {
+    signature
+        .iter()
+        .flat_map(|component| component.to_le_bytes())
+        .collect()
+}
+
+fn compute_similar_texts(
+    app: &AppHandle,
+    library_id: &str,
+    mut should_continue: impl FnMut(u64, u64) -> bool,
+) -> Result<(SimilarContentReportView, bool), String> {
+    let feature_started = Instant::now();
+    let database = open_worker_database(app)?;
+    let library = database
+        .library_root(library_id)
+        .map_err(display_error)?
+        .ok_or_else(|| "资料库不存在或未授权".to_owned())?;
+    let root = PathBuf::from(library.root_path)
+        .canonicalize()
+        .map_err(display_error)?;
+    let mut cursor = None;
+    let mut files = HashMap::<String, IndexedFile>::new();
+    let mut hashes = Vec::new();
+    let mut minhashes = HashMap::<String, [u64; TEXT_MINHASH_COMPONENTS]>::new();
+    let mut computed_features = 0_usize;
+    let mut cache_hits = 0_usize;
+    let mut skipped_files = 0_usize;
+    let total_files = database
+        .library_overview(library_id)
+        .map_err(display_error)?
+        .total_files;
+    let mut processed_files = 0_u64;
+    let mut interrupted = false;
+    'pages: loop {
+        let page = database
+            .list_files_page(library_id, cursor.as_ref(), 500)
+            .map_err(display_error)?;
+        for file in page.items {
+            processed_files = processed_files.saturating_add(1);
+            if !should_continue(processed_files, total_files) {
+                interrupted = true;
+                break 'pages;
+            }
+            let path = PathBuf::from(&file.current_path);
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !matches!(
+                extension.as_str(),
+                "txt"
+                    | "md"
+                    | "log"
+                    | "csv"
+                    | "tsv"
+                    | "json"
+                    | "xml"
+                    | "yaml"
+                    | "yml"
+                    | "toml"
+                    | "rs"
+                    | "py"
+                    | "js"
+                    | "ts"
+                    | "css"
+                    | "html"
+            ) {
+                continue;
+            }
+            let canonical = match path.canonicalize() {
+                Ok(path) if path.starts_with(&root) => path,
+                _ => {
+                    skipped_files += 1;
+                    continue;
+                }
+            };
+            let cached_hash = u64_feature(
+                database
+                    .file_feature(&file, "text_simhash", TEXT_SIMHASH_VERSION)
+                    .map_err(display_error)?,
+            );
+            let cached_minhash = minhash_feature(
+                database
+                    .file_feature(&file, "text_minhash", TEXT_MINHASH_VERSION)
+                    .map_err(display_error)?,
+            );
+            let (hash, minhash) = if let (Some(hash), Some(minhash)) = (cached_hash, cached_minhash)
+            {
+                cache_hits += 1;
+                (hash, minhash)
+            } else {
+                const MAX_TEXT_BYTES: u64 = 512 * 1024;
+                let mut bytes = Vec::new();
+                if File::open(&canonical)
+                    .and_then(|file| file.take(MAX_TEXT_BYTES).read_to_end(&mut bytes))
+                    .is_err()
+                {
+                    skipped_files += 1;
+                    continue;
+                }
+                let text = String::from_utf8_lossy(&bytes);
+                if text
+                    .chars()
+                    .filter(|character| character.is_alphanumeric())
+                    .take(24)
+                    .count()
+                    < 24
+                {
+                    skipped_files += 1;
+                    continue;
+                }
+                let Some(hash) = text_simhash(&text) else {
+                    skipped_files += 1;
+                    continue;
+                };
+                let Some(minhash) = text_minhash(&text) else {
+                    skipped_files += 1;
+                    continue;
+                };
+                database
+                    .save_file_feature(&FileFeature {
+                        file_id: file.id.clone(),
+                        feature_kind: "text_simhash".to_owned(),
+                        model_version: TEXT_SIMHASH_VERSION.to_owned(),
+                        size: file.size,
+                        modified_at_ns: file.modified_at_ns,
+                        changed_at_ns: file.changed_at_ns,
+                        dimensions: 64,
+                        quantization: "binary64".to_owned(),
+                        feature_blob: hash.to_le_bytes().to_vec(),
+                        created_at_ms: now_ms(),
+                    })
+                    .map_err(display_error)?;
+                database
+                    .save_file_feature(&FileFeature {
+                        file_id: file.id.clone(),
+                        feature_kind: "text_minhash".to_owned(),
+                        model_version: TEXT_MINHASH_VERSION.to_owned(),
+                        size: file.size,
+                        modified_at_ns: file.modified_at_ns,
+                        changed_at_ns: file.changed_at_ns,
+                        dimensions: TEXT_MINHASH_COMPONENTS as u32,
+                        quantization: "u64x32".to_owned(),
+                        feature_blob: minhash_blob(&minhash),
+                        created_at_ms: now_ms(),
+                    })
+                    .map_err(display_error)?;
+                computed_features += 1;
+                (hash, minhash)
+            };
+            hashes.push(SimilarityHashInput {
+                id: file.id.clone(),
+                hash,
+            });
+            minhashes.insert(file.id.clone(), minhash);
+            files.insert(file.id.clone(), file);
+        }
+        let Some(next) = page.next_cursor else { break };
+        cursor = Some(next);
+    }
+    let feature_ms = feature_started.elapsed().as_millis() as u64;
+    let candidate_started = Instant::now();
+    let candidates = find_similarity_candidates(&hashes, 8).map_err(display_error)?;
+    let candidate_pairs = candidates.len();
+    let pairs = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let left = files.get(&candidate.left_id)?;
+            let right = files.get(&candidate.right_id)?;
+            let minhash_similarity = minhash_similarity(
+                minhashes.get(&candidate.left_id)?,
+                minhashes.get(&candidate.right_id)?,
+            );
+            if minhash_similarity < 0.25 {
+                return None;
+            }
+            Some(SimilarContentPairView {
+                left_file_id: left.id.clone(),
+                left_path: left.current_path.clone(),
+                right_file_id: right.id.clone(),
+                right_path: right.current_path.clone(),
+                hamming_distance: candidate.hamming_distance,
+                secondary_distance: None,
+                secondary_similarity: minhash_similarity,
+                similarity: candidate.similarity * 0.45 + minhash_similarity * 0.55,
+                verification: "SimHash 候选 + MinHash 字符五元组复核".to_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let candidate_ms = candidate_started.elapsed().as_millis() as u64;
+    let secondary_verified_pairs = pairs.len();
+    Ok((
+        SimilarContentReportView {
+            content_kind: "text".to_owned(),
+            input_files: hashes.len(),
+            computed_features,
+            cache_hits,
+            skipped_files,
+            candidate_pairs,
+            secondary_verified_pairs,
+            feature_ms,
+            candidate_ms,
+            algorithm_profile: "simhash64-mih3-r8+minhash32-v1".to_owned(),
+            pairs,
+        },
+        interrupted,
+    ))
+}
+
+fn compute_similar_images(
+    app: &AppHandle,
+    library_id: &str,
+    mut should_continue: impl FnMut(u64, u64) -> bool,
+) -> Result<(SimilarContentReportView, bool), String> {
+    let feature_started = Instant::now();
+    let database = open_worker_database(app)?;
+    let library = database
+        .library_root(library_id)
+        .map_err(display_error)?
+        .ok_or_else(|| "资料库不存在或未授权".to_owned())?;
+    let root = PathBuf::from(library.root_path)
+        .canonicalize()
+        .map_err(display_error)?;
+    let mut cursor = None;
+    let mut files = HashMap::<String, IndexedFile>::new();
+    let mut hashes = Vec::new();
+    let mut phashes = HashMap::<String, u64>::new();
+    let mut computed_features = 0_usize;
+    let mut cache_hits = 0_usize;
+    let mut skipped_files = 0_usize;
+    let total_files = database
+        .library_overview(library_id)
+        .map_err(display_error)?
+        .total_files;
+    let mut processed_files = 0_u64;
+    let mut interrupted = false;
+    'pages: loop {
+        let page = database
+            .list_files_page(library_id, cursor.as_ref(), 500)
+            .map_err(display_error)?;
+        for file in page.items {
+            processed_files = processed_files.saturating_add(1);
+            if !should_continue(processed_files, total_files) {
+                interrupted = true;
+                break 'pages;
+            }
+            let path = PathBuf::from(&file.current_path);
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp") {
+                continue;
+            }
+            let canonical = match path.canonicalize() {
+                Ok(path) if path.starts_with(&root) => path,
+                _ => {
+                    skipped_files += 1;
+                    continue;
+                }
+            };
+            let cached_dhash = u64_feature(
+                database
+                    .file_feature(&file, "image_dhash", IMAGE_DHASH_VERSION)
+                    .map_err(display_error)?,
+            );
+            let cached_phash = u64_feature(
+                database
+                    .file_feature(&file, "image_phash", IMAGE_PHASH_VERSION)
+                    .map_err(display_error)?,
+            );
+            let (hash, phash) = if let (Some(hash), Some(phash)) = (cached_dhash, cached_phash) {
+                cache_hits += 1;
+                (hash, phash)
+            } else {
+                let (hash, phash) = match image_hashes_from_path(&canonical) {
+                    Ok(hashes) => hashes,
+                    Err(_) => {
+                        skipped_files += 1;
+                        continue;
+                    }
+                };
+                database
+                    .save_file_feature(&FileFeature {
+                        file_id: file.id.clone(),
+                        feature_kind: "image_dhash".to_owned(),
+                        model_version: IMAGE_DHASH_VERSION.to_owned(),
+                        size: file.size,
+                        modified_at_ns: file.modified_at_ns,
+                        changed_at_ns: file.changed_at_ns,
+                        dimensions: 64,
+                        quantization: "binary64".to_owned(),
+                        feature_blob: hash.to_le_bytes().to_vec(),
+                        created_at_ms: now_ms(),
+                    })
+                    .map_err(display_error)?;
+                database
+                    .save_file_feature(&FileFeature {
+                        file_id: file.id.clone(),
+                        feature_kind: "image_phash".to_owned(),
+                        model_version: IMAGE_PHASH_VERSION.to_owned(),
+                        size: file.size,
+                        modified_at_ns: file.modified_at_ns,
+                        changed_at_ns: file.changed_at_ns,
+                        dimensions: 64,
+                        quantization: "binary64".to_owned(),
+                        feature_blob: phash.to_le_bytes().to_vec(),
+                        created_at_ms: now_ms(),
+                    })
+                    .map_err(display_error)?;
+                computed_features += 1;
+                (hash, phash)
+            };
+            hashes.push(SimilarityHashInput {
+                id: file.id.clone(),
+                hash,
+            });
+            phashes.insert(file.id.clone(), phash);
+            files.insert(file.id.clone(), file);
+        }
+        let Some(next) = page.next_cursor else { break };
+        cursor = Some(next);
+    }
+    let feature_ms = feature_started.elapsed().as_millis() as u64;
+    let candidate_started = Instant::now();
+    let candidates = find_similarity_candidates(&hashes, 8).map_err(display_error)?;
+    let candidate_pairs = candidates.len();
+    let pairs = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let left = files.get(&candidate.left_id)?;
+            let right = files.get(&candidate.right_id)?;
+            let phash_distance =
+                (phashes.get(&candidate.left_id)? ^ phashes.get(&candidate.right_id)?).count_ones();
+            if phash_distance > 12 {
+                return None;
+            }
+            let phash_similarity = 1.0 - phash_distance as f32 / 64.0;
+            Some(SimilarContentPairView {
+                left_file_id: left.id.clone(),
+                left_path: left.current_path.clone(),
+                right_file_id: right.id.clone(),
+                right_path: right.current_path.clone(),
+                hamming_distance: candidate.hamming_distance,
+                secondary_distance: Some(phash_distance),
+                secondary_similarity: phash_similarity,
+                similarity: candidate.similarity * 0.4 + phash_similarity * 0.6,
+                verification: "dHash 候选 + DCT pHash 复核".to_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let candidate_ms = candidate_started.elapsed().as_millis() as u64;
+    let secondary_verified_pairs = pairs.len();
+    Ok((
+        SimilarContentReportView {
+            content_kind: "image".to_owned(),
+            input_files: hashes.len(),
+            computed_features,
+            cache_hits,
+            skipped_files,
+            candidate_pairs,
+            secondary_verified_pairs,
+            feature_ms,
+            candidate_ms,
+            algorithm_profile: "dhash64-mih3-r8+phash64-r12-v1".to_owned(),
+            pairs,
+        },
+        interrupted,
+    ))
+}
+
 #[tauri::command]
-async fn exact_duplicates(
+fn start_similarity_analysis(
     app: AppHandle,
     library_id: String,
-) -> Result<DuplicateReportView, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    content_kind: String,
+) -> Result<String, String> {
+    let job_kind = match content_kind.as_str() {
+        "text" => "similar_text_analysis",
+        "image" => "similar_image_analysis",
+        _ => return Err("不支持的相似内容类型".to_owned()),
+    };
+    let timestamp = now_ms();
+    let mut job_id = unique_id(job_kind, timestamp);
+    {
         let state = app.state::<DesktopState>();
-        let database = lock_database(&state)?;
-        let library = database
+        let mut database = lock_database(&state)?;
+        database
             .library_root(&library_id)
             .map_err(display_error)?
             .ok_or_else(|| "资料库不存在或未授权".to_owned())?;
-        let root = PathBuf::from(&library.root_path)
-            .canonicalize()
+        let payload = serde_json::to_string(&SimilarityPayload {
+            library_id,
+            content_kind,
+        })
+        .map_err(display_error)?;
+        job_id = database
+            .enqueue_or_reuse_job(&NewJob {
+                id: job_id.clone(),
+                kind: job_kind.to_owned(),
+                payload_json: payload,
+                priority: 105,
+                progress_total: None,
+                created_at_ms: timestamp,
+            })
             .map_err(display_error)?;
-        let mut cursor = None;
-        let mut paths = Vec::new();
-        loop {
-            let page = database
-                .list_files_page(&library_id, cursor.as_ref(), 500)
-                .map_err(display_error)?;
-            for file in page.items {
-                let path = PathBuf::from(file.current_path);
-                if let Ok(canonical) = path.canonicalize() {
-                    if canonical.starts_with(&root) {
-                        paths.push(canonical);
-                    }
+    }
+    let worker_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || run_one_job(worker_app));
+    Ok(job_id)
+}
+
+#[tauri::command]
+fn similarity_result(
+    state: State<'_, DesktopState>,
+    job_id: String,
+) -> Result<Option<SimilarContentReportView>, String> {
+    let database = lock_database(&state)?;
+    let Some(json) = database.job_result(&job_id).map_err(display_error)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&json).map(Some).map_err(display_error)
+}
+
+#[tauri::command]
+fn start_exact_duplicate_analysis(app: AppHandle, library_id: String) -> Result<String, String> {
+    let timestamp = now_ms();
+    let mut job_id = unique_id("duplicates", timestamp);
+    {
+        let state = app.state::<DesktopState>();
+        let mut database = lock_database(&state)?;
+        database
+            .library_root(&library_id)
+            .map_err(display_error)?
+            .ok_or_else(|| "资料库不存在或未授权".to_owned())?;
+        let payload =
+            serde_json::to_string(&DuplicatePayload { library_id }).map_err(display_error)?;
+        job_id = database
+            .enqueue_or_reuse_job(&NewJob {
+                id: job_id.clone(),
+                kind: "exact_duplicate_analysis".to_owned(),
+                payload_json: payload,
+                priority: 110,
+                progress_total: None,
+                created_at_ms: timestamp,
+            })
+            .map_err(display_error)?;
+    }
+    let worker_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || run_one_job(worker_app));
+    Ok(job_id)
+}
+
+#[tauri::command]
+fn exact_duplicate_result(
+    state: State<'_, DesktopState>,
+    job_id: String,
+) -> Result<Option<DuplicateReportView>, String> {
+    let database = lock_database(&state)?;
+    let Some(json) = database.job_result(&job_id).map_err(display_error)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&json).map(Some).map_err(display_error)
+}
+
+fn compute_exact_duplicates(
+    app: &AppHandle,
+    library_id: &str,
+    should_continue: impl FnMut(DuplicateProgress) -> bool,
+) -> Result<(DuplicateReportView, bool), String> {
+    // P2：使用独立 worker 连接，避免持有主互斥锁阻塞 UI 轮询。
+    let worker = open_worker_database(app)?;
+    let library = worker
+        .library_root(library_id)
+        .map_err(display_error)?
+        .ok_or_else(|| "资料库不存在或未授权".to_owned())?;
+    let root = PathBuf::from(&library.root_path)
+        .canonicalize()
+        .map_err(display_error)?;
+    let mut cursor = None;
+    let mut indexed = Vec::new();
+    loop {
+        let page = worker
+            .list_files_page(library_id, cursor.as_ref(), 500)
+            .map_err(display_error)?;
+        for file in page.items {
+            let path = PathBuf::from(&file.current_path);
+            if let Ok(canonical) = path.canonicalize() {
+                if canonical.starts_with(&root) {
+                    let cache = worker
+                        .file_hash_cache(library_id, &file, EXACT_HASH_ALGORITHM)
+                        .map_err(display_error)?;
+                    indexed.push((file, canonical, cache));
                 }
             }
-            let Some(next) = page.next_cursor else { break };
-            cursor = Some(next);
         }
-        drop(database);
-        let report = find_exact_duplicates(&paths);
-        Ok(DuplicateReportView {
-            input_files: report.stats.input_files,
-            quick_fingerprinted_files: report.stats.quick_fingerprinted_files,
-            fully_hashed_files: report.stats.fully_hashed_files,
-            skipped_files: report.stats.skipped_files,
-            groups: report
-                .groups
-                .into_iter()
-                .map(|group| {
-                    let paths = group
-                        .paths
-                        .into_iter()
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .collect::<Vec<_>>();
-                    let suggested_keep = paths.first().cloned().unwrap_or_default();
-                    DuplicateGroupView {
-                        id: group
-                            .content_hash
-                            .iter()
-                            .map(|byte| format!("{byte:02x}"))
-                            .collect(),
-                        size: group.size,
-                        potential_savings: group
-                            .size
-                            .saturating_mul(paths.len().saturating_sub(1) as u64),
-                        paths,
-                        suggested_keep,
-                    }
-                })
-                .collect(),
+        let Some(next) = page.next_cursor else { break };
+        cursor = Some(next);
+    }
+    let inputs = indexed
+        .iter()
+        .map(|(file, path, cache)| DuplicateInput {
+            path: path.clone(),
+            snapshot: FileSnapshot {
+                size: file.size,
+                modified_at_ns: file.modified_at_ns,
+                changed_at_ns: file.changed_at_ns,
+                created_at_ns: None,
+            },
+            cached_quick_fingerprint: cache
+                .as_ref()
+                .and_then(|entry| parse_hash_hex(&entry.quick_fingerprint)),
+            cached_content_hash: cache
+                .as_ref()
+                .and_then(|entry| entry.content_hash.as_deref())
+                .and_then(parse_hash_hex),
         })
-    })
-    .await
-    .map_err(display_error)?
+        .collect::<Vec<_>>();
+    let controlled = find_exact_duplicates_cached_controlled(&inputs, should_continue);
+    let files_by_path = indexed
+        .iter()
+        .map(|(file, path, _)| (path.clone(), file))
+        .collect::<HashMap<_, _>>();
+    if !controlled.result.computed_hashes.is_empty() {
+        let timestamp = now_ms();
+        let caches: Vec<FileHashCache> = controlled
+            .result
+            .computed_hashes
+            .iter()
+            .filter_map(|computed| {
+                let file = files_by_path.get(&computed.path)?;
+                Some(FileHashCache {
+                    file_id: file.id.clone(),
+                    size: file.size,
+                    modified_at_ns: file.modified_at_ns,
+                    changed_at_ns: file.changed_at_ns,
+                    algorithm: EXACT_HASH_ALGORITHM.to_owned(),
+                    quick_fingerprint: hash_hex(computed.quick_fingerprint),
+                    content_hash: computed.content_hash.map(hash_hex),
+                    updated_at_ms: timestamp,
+                })
+            })
+            .collect();
+        let cache_refs: Vec<&FileHashCache> = caches.iter().collect();
+        worker
+            .save_file_hash_cache_batch(library_id, &cache_refs)
+            .map_err(display_error)?;
+    }
+    let report = controlled.result.report;
+    let view = DuplicateReportView {
+        input_files: report.stats.input_files,
+        quick_fingerprinted_files: report.stats.quick_fingerprinted_files,
+        fully_hashed_files: report.stats.fully_hashed_files,
+        quick_cache_hits: report.stats.quick_cache_hits,
+        full_cache_hits: report.stats.full_cache_hits,
+        skipped_files: report.stats.skipped_files,
+        groups: report
+            .groups
+            .into_iter()
+            .map(|group| duplicate_group_view(group, &files_by_path))
+            .collect(),
+    };
+    Ok((view, controlled.interrupted))
+}
+
+fn duplicate_group_view(
+    group: guixu_analysis::DuplicateGroup,
+    files_by_path: &HashMap<PathBuf, &IndexedFile>,
+) -> DuplicateGroupView {
+    let paths = group
+        .paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let ranked = rank_duplicate_retention(
+        &group
+            .paths
+            .iter()
+            .filter_map(|path| {
+                files_by_path.get(path).map(|file| RetentionInput {
+                    path: path.clone(),
+                    modified_at_ns: file.modified_at_ns,
+                })
+            })
+            .collect::<Vec<_>>(),
+    );
+    let suggested_keep = ranked
+        .first()
+        .map(|recommendation| recommendation.path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| paths.first().cloned().unwrap_or_default());
+    let files = ranked
+        .into_iter()
+        .filter_map(|recommendation| {
+            let file = files_by_path.get(&recommendation.path)?;
+            let path = recommendation.path.to_string_lossy().into_owned();
+            Some(DuplicateFileView {
+                file_id: file.id.clone(),
+                suggested_keep: path == suggested_keep,
+                path,
+                retention_score: recommendation.score,
+                reasons: recommendation.reasons,
+            })
+        })
+        .collect();
+    DuplicateGroupView {
+        id: hash_hex(group.content_hash),
+        size: group.size,
+        potential_savings: group
+            .size
+            .saturating_mul(paths.len().saturating_sub(1) as u64),
+        paths,
+        suggested_keep,
+        files,
+    }
 }
 
 #[tauri::command]
@@ -891,6 +2137,7 @@ async fn undo_operation(app: AppHandle, operation_id: String) -> Result<Executio
 fn operation_view(operation: StoredOperation) -> OperationView {
     OperationView {
         id: operation.id,
+        operation_kind: operation.operation_kind.as_str().to_owned(),
         status: operation.status,
         created_at_ms: operation.created_at_ms,
         completed_at_ms: operation.completed_at_ms,
@@ -922,22 +2169,41 @@ fn category_label(category: FileCategory) -> &'static str {
     }
 }
 
-fn run_one_scan_job(app: AppHandle) {
+fn run_one_job(app: AppHandle) -> bool {
     let worker_id = format!("desktop-{}", std::process::id());
     let mut database = match open_worker_database(&app) {
         Ok(database) => database,
-        Err(_) => return,
+        Err(_) => return false,
     };
     let claimed = match database.claim_next_job(&worker_id, now_ms(), 24 * 60 * 60 * 1000) {
         Ok(Some(job)) => job,
-        _ => return,
+        _ => return false,
     };
+    if claimed.kind == "exact_duplicate_analysis" {
+        drop(database);
+        run_duplicate_analysis_job(app, &worker_id, claimed);
+        return true;
+    }
+    if matches!(
+        claimed.kind.as_str(),
+        "similar_text_analysis" | "similar_image_analysis"
+    ) {
+        drop(database);
+        run_similarity_analysis_job(app, &worker_id, claimed);
+        return true;
+    }
+    if !matches!(claimed.kind.as_str(), "library_scan" | "snapshot_reconcile") {
+        let detail =
+            serde_json::json!({ "message": format!("未知任务类型：{}", claimed.kind) }).to_string();
+        let _ = database.fail_job(&claimed.id, &worker_id, now_ms(), Some(&detail));
+        return true;
+    }
     let payload: ScanPayload = match serde_json::from_str(&claimed.payload_json) {
         Ok(payload) => payload,
         Err(error) => {
             let detail = serde_json::json!({ "message": error.to_string() }).to_string();
             let _ = database.fail_job(&claimed.id, &worker_id, now_ms(), Some(&detail));
-            return;
+            return true;
         }
     };
     let control_database = match open_worker_database(&app) {
@@ -945,7 +2211,7 @@ fn run_one_scan_job(app: AppHandle) {
         Err(error) => {
             let detail = serde_json::json!({ "message": error }).to_string();
             let _ = database.fail_job(&claimed.id, &worker_id, now_ms(), Some(&detail));
-            return;
+            return true;
         }
     };
     let mut last_reported_entries = 0_u64;
@@ -1061,7 +2327,14 @@ fn run_one_scan_job(app: AppHandle) {
                         );
                     }
                     _ => {
-                        let _ = control_database.complete_job(&claimed.id, &worker_id, now_ms());
+                        finish_job(
+                            &control_database,
+                            &app,
+                            &claimed.id,
+                            &worker_id,
+                            control_database.complete_job(&claimed.id, &worker_id, now_ms()),
+                            now_ms(),
+                        );
                     }
                 }
             }
@@ -1073,6 +2346,289 @@ fn run_one_scan_job(app: AppHandle) {
             let _ = app.emit("job-status-changed", &claimed.id);
         }
     }
+    true
+}
+
+fn fail_claimed_job(app: &AppHandle, job_id: &str, worker_id: &str, message: &str) {
+    let detail = serde_json::json!({ "message": message }).to_string();
+    if let Ok(database) = open_worker_database(app) {
+        let _ = database.fail_job(job_id, worker_id, now_ms(), Some(&detail));
+    } else {
+        let state = app.state::<DesktopState>();
+        if let Ok(database) = state.database.lock() {
+            let _ = database.fail_job(job_id, worker_id, now_ms(), Some(&detail));
+        }
+    }
+    let _ = app.emit("job-status-changed", job_id);
+}
+
+fn run_duplicate_analysis_job(app: AppHandle, worker_id: &str, claimed: ClaimedJob) {
+    let payload: DuplicatePayload = match serde_json::from_str(&claimed.payload_json) {
+        Ok(payload) => payload,
+        Err(error) => {
+            fail_claimed_job(&app, &claimed.id, worker_id, &error.to_string());
+            return;
+        }
+    };
+    let control_database = match open_worker_database(&app) {
+        Ok(database) => database,
+        Err(error) => {
+            fail_claimed_job(&app, &claimed.id, worker_id, &error);
+            return;
+        }
+    };
+    let mut requested_control = None;
+    let mut control_error = None;
+    let result = compute_exact_duplicates(&app, &payload.library_id, |progress| {
+        let timestamp = now_ms();
+        let current = u64::try_from(progress.processed_files).unwrap_or(u64::MAX);
+        let total = u64::try_from(progress.total_work).unwrap_or(u64::MAX);
+        if let Err(error) = control_database.update_job_progress(
+            &claimed.id,
+            worker_id,
+            current,
+            Some(total),
+            timestamp,
+        ) {
+            control_error = Some(error.to_string());
+            return false;
+        }
+        if let Err(error) =
+            control_database.renew_job_lease(&claimed.id, worker_id, timestamp, 24 * 60 * 60 * 1000)
+        {
+            control_error = Some(error.to_string());
+            return false;
+        }
+        let _ = app.emit("job-status-changed", &claimed.id);
+        match control_database.job_status(&claimed.id) {
+            Ok(Some(JobStatus::PauseRequested)) => {
+                requested_control = Some(JobStatus::PauseRequested);
+                false
+            }
+            Ok(Some(JobStatus::CancelRequested)) => {
+                requested_control = Some(JobStatus::CancelRequested);
+                false
+            }
+            Ok(Some(JobStatus::Running)) => true,
+            Ok(Some(status)) => {
+                control_error = Some(format!("重复分析进入了意外状态：{status:?}"));
+                false
+            }
+            Ok(None) => {
+                control_error = Some("重复分析任务记录消失".to_owned());
+                false
+            }
+            Err(error) => {
+                control_error = Some(error.to_string());
+                false
+            }
+        }
+    });
+    match result {
+        Ok((report, interrupted)) => {
+            if let Some(error) = control_error {
+                let detail = serde_json::json!({ "message": error }).to_string();
+                let _ = control_database.fail_job(&claimed.id, worker_id, now_ms(), Some(&detail));
+            } else if interrupted {
+                let requested = requested_control.or_else(|| {
+                    control_database
+                        .job_status(&claimed.id)
+                        .ok()
+                        .flatten()
+                        .filter(|status| {
+                            matches!(
+                                status,
+                                JobStatus::PauseRequested | JobStatus::CancelRequested
+                            )
+                        })
+                });
+                if let Some(requested) = requested {
+                    let _ = control_database.acknowledge_job_control(
+                        &claimed.id,
+                        worker_id,
+                        requested,
+                        now_ms(),
+                    );
+                }
+            } else {
+                let json = match serde_json::to_string(&report) {
+                    Ok(json) => json,
+                    Err(error) => {
+                        let detail =
+                            serde_json::json!({ "message": error.to_string() }).to_string();
+                        let _ = control_database.fail_job(
+                            &claimed.id,
+                            worker_id,
+                            now_ms(),
+                            Some(&detail),
+                        );
+                        let _ = app.emit("job-status-changed", &claimed.id);
+                        return;
+                    }
+                };
+                finish_job(
+                    &control_database,
+                    &app,
+                    &claimed.id,
+                    worker_id,
+                    control_database.complete_job_with_result(
+                        &claimed.id,
+                        worker_id,
+                        &json,
+                        now_ms(),
+                    ),
+                    now_ms(),
+                );
+            }
+        }
+        Err(error) => {
+            let detail = serde_json::json!({ "message": error }).to_string();
+            let _ = control_database.fail_job(&claimed.id, worker_id, now_ms(), Some(&detail));
+        }
+    }
+    let _ = app.emit("job-status-changed", &claimed.id);
+}
+
+fn run_similarity_analysis_job(app: AppHandle, worker_id: &str, claimed: ClaimedJob) {
+    let payload: SimilarityPayload = match serde_json::from_str(&claimed.payload_json) {
+        Ok(payload) => payload,
+        Err(error) => {
+            fail_claimed_job(&app, &claimed.id, worker_id, &error.to_string());
+            return;
+        }
+    };
+    let control_database = match open_worker_database(&app) {
+        Ok(database) => database,
+        Err(error) => {
+            fail_claimed_job(&app, &claimed.id, worker_id, &error);
+            return;
+        }
+    };
+    let mut requested_control = None;
+    let mut control_error = None;
+    let mut last_reported = 0_u64;
+    let mut last_reported_at = Instant::now();
+    let result = {
+        let mut control = |current: u64, total: u64| {
+            let should_report = current == total
+                || current.saturating_sub(last_reported) >= 16
+                || last_reported_at.elapsed() >= Duration::from_millis(250);
+            if !should_report {
+                return true;
+            }
+            let timestamp = now_ms();
+            if let Err(error) = control_database.update_job_progress(
+                &claimed.id,
+                worker_id,
+                current,
+                Some(total),
+                timestamp,
+            ) {
+                control_error = Some(error.to_string());
+                return false;
+            }
+            if let Err(error) = control_database.renew_job_lease(
+                &claimed.id,
+                worker_id,
+                timestamp,
+                24 * 60 * 60 * 1000,
+            ) {
+                control_error = Some(error.to_string());
+                return false;
+            }
+            last_reported = current;
+            last_reported_at = Instant::now();
+            let _ = app.emit("job-status-changed", &claimed.id);
+            match control_database.job_status(&claimed.id) {
+                Ok(Some(JobStatus::PauseRequested)) => {
+                    requested_control = Some(JobStatus::PauseRequested);
+                    false
+                }
+                Ok(Some(JobStatus::CancelRequested)) => {
+                    requested_control = Some(JobStatus::CancelRequested);
+                    false
+                }
+                Ok(Some(JobStatus::Running)) => true,
+                Ok(Some(status)) => {
+                    control_error = Some(format!("相似内容分析进入了意外状态：{status:?}"));
+                    false
+                }
+                Ok(None) => {
+                    control_error = Some("相似内容分析任务记录消失".to_owned());
+                    false
+                }
+                Err(error) => {
+                    control_error = Some(error.to_string());
+                    false
+                }
+            }
+        };
+        match payload.content_kind.as_str() {
+            "text" => compute_similar_texts(&app, &payload.library_id, &mut control),
+            "image" => compute_similar_images(&app, &payload.library_id, &mut control),
+            _ => Err("不支持的相似内容任务类型".to_owned()),
+        }
+    };
+    match result {
+        Ok((report, interrupted)) => {
+            if let Some(error) = control_error {
+                let detail = serde_json::json!({ "message": error }).to_string();
+                let _ = control_database.fail_job(&claimed.id, worker_id, now_ms(), Some(&detail));
+            } else if interrupted {
+                let requested = requested_control.or_else(|| {
+                    control_database
+                        .job_status(&claimed.id)
+                        .ok()
+                        .flatten()
+                        .filter(|status| {
+                            matches!(
+                                status,
+                                JobStatus::PauseRequested | JobStatus::CancelRequested
+                            )
+                        })
+                });
+                if let Some(requested) = requested {
+                    let _ = control_database.acknowledge_job_control(
+                        &claimed.id,
+                        worker_id,
+                        requested,
+                        now_ms(),
+                    );
+                }
+            } else {
+                match serde_json::to_string(&report) {
+                    Ok(json) => finish_job(
+                        &control_database,
+                        &app,
+                        &claimed.id,
+                        worker_id,
+                        control_database.complete_job_with_result(
+                            &claimed.id,
+                            worker_id,
+                            &json,
+                            now_ms(),
+                        ),
+                        now_ms(),
+                    ),
+                    Err(error) => {
+                        let detail =
+                            serde_json::json!({ "message": error.to_string() }).to_string();
+                        let _ = control_database.fail_job(
+                            &claimed.id,
+                            worker_id,
+                            now_ms(),
+                            Some(&detail),
+                        );
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            let detail = serde_json::json!({ "message": error }).to_string();
+            let _ = control_database.fail_job(&claimed.id, worker_id, now_ms(), Some(&detail));
+        }
+    }
+    let _ = app.emit("job-status-changed", &claimed.id);
 }
 
 fn schedule_watch_reconciliation(app: &AppHandle) -> Result<(), String> {
@@ -1093,7 +2649,7 @@ fn schedule_watch_reconciliation(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
     let state = app.state::<DesktopState>();
-    let database = lock_database(&state)?;
+    let mut database = lock_database(&state)?;
     for (library_id, request) in requests {
         let root = database
             .library_root(&library_id)
@@ -1104,6 +2660,12 @@ fn schedule_watch_reconciliation(app: &AppHandle) -> Result<(), String> {
             ReconcileRequest::Directories(directories) => directories,
         };
         for directory in directories {
+            if directory
+                .components()
+                .any(|component| component.as_os_str() == ".guixu-trash")
+            {
+                continue;
+            }
             let Some(root_path) = directory.to_str() else {
                 continue;
             };
@@ -1115,7 +2677,7 @@ fn schedule_watch_reconciliation(app: &AppHandle) -> Result<(), String> {
             })
             .map_err(display_error)?;
             database
-                .enqueue_job(&NewJob {
+                .enqueue_or_reuse_job(&NewJob {
                     id,
                     kind: "snapshot_reconcile".to_owned(),
                     payload_json: payload,
@@ -1125,7 +2687,7 @@ fn schedule_watch_reconciliation(app: &AppHandle) -> Result<(), String> {
                 })
                 .map_err(display_error)?;
             let worker_app = app.clone();
-            tauri::async_runtime::spawn_blocking(move || run_one_scan_job(worker_app));
+            tauri::async_runtime::spawn_blocking(move || run_one_job(worker_app));
         }
     }
     Ok(())
@@ -1152,6 +2714,57 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+#[cfg(feature = "e2e")]
+fn register_e2e_library(database: &mut Database) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(path) = std::env::var_os("GUIXU_E2E_LIBRARY") else {
+        return Ok(());
+    };
+    let canonical = PathBuf::from(path).canonicalize()?;
+    if !canonical.is_dir() {
+        return Err("GUIXU_E2E_LIBRARY 必须指向现有文件夹".into());
+    }
+    let root_path = canonical
+        .to_str()
+        .ok_or("GUIXU_E2E_LIBRARY 必须是有效 UTF-8 路径")?
+        .to_owned();
+    let timestamp = now_ms();
+    let record = database.register_library_root(
+        &unique_id("e2e-library", timestamp),
+        &unique_id("e2e-root", timestamp),
+        "E2E Fixture",
+        &root_path,
+        timestamp,
+    )?;
+    let payload = serde_json::to_string(&ScanPayload {
+        library_id: record.library_id,
+        root_path: record.root_path,
+    })?;
+    database.enqueue_or_reuse_job(&NewJob {
+        id: unique_id("e2e-scan", timestamp),
+        kind: "library_scan".to_owned(),
+        payload_json: payload,
+        priority: 100,
+        progress_total: None,
+        created_at_ms: timestamp,
+    })?;
+    Ok(())
+}
+
+fn hash_hex(hash: [u8; 32]) -> String {
+    hash.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn parse_hash_hex(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut hash = [0_u8; 32];
+    for (index, byte) in hash.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(hash)
+}
+
 fn unique_id(prefix: &str, timestamp: i64) -> String {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1162,10 +2775,64 @@ fn display_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+use guixu_storage::JobTransferResult;
+
+/// H6 修复：安全结束任务——若状态转移因竞态（任务已被中断）而失败，自动确认中断请求。
+fn finish_job(
+    db: &Database,
+    app: &AppHandle,
+    job_id: &str,
+    worker_id: &str,
+    outcome: Result<JobTransferResult, guixu_storage::StorageError>,
+    now_ms: i64,
+) {
+    match outcome {
+        Ok(transfer) if transfer.applied => {
+            let _ = app.emit("job-status-changed", job_id);
+        }
+        Ok(transfer) => {
+            if let Some(ref status) = transfer.current_status {
+                match status.as_str() {
+                    "cancel_requested" => {
+                        let _ = db
+                            .acknowledge_job_control(
+                                job_id,
+                                worker_id,
+                                JobStatus::CancelRequested,
+                                now_ms,
+                            )
+                            .ok();
+                    }
+                    "pause_requested" => {
+                        let _ = db
+                            .acknowledge_job_control(
+                                job_id,
+                                worker_id,
+                                JobStatus::PauseRequested,
+                                now_ms,
+                            )
+                            .ok();
+                    }
+                    _ => {}
+                }
+            }
+            let _ = app.emit("job-status-changed", job_id);
+        }
+        Err(error) => {
+            let detail = serde_json::json!({ "message": error.to_string() }).to_string();
+            let _ = db.fail_job(job_id, worker_id, now_ms, Some(&detail));
+            let _ = app.emit("job-status-changed", job_id);
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
+    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    #[cfg(feature = "e2e")]
+    let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
+
+    builder
         .setup(|app| {
             let data_directory = std::env::var_os("GUIXU_DATA_DIR")
                 .map(PathBuf::from)
@@ -1176,6 +2843,20 @@ pub fn run() {
                 .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
             audit_incomplete_operations(&mut database, now_ms())
                 .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
+            #[cfg(feature = "e2e")]
+            register_e2e_library(&mut database)?;
+            // P5：清扫崩溃残留的 .guixu-*.tmp 临时文件。
+            if let Some(root) = database.latest_library_root().ok().flatten() {
+                if let Ok(entries) = std::fs::read_dir(Path::new(&root.root_path)) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let name_str = name.to_string_lossy();
+                        if name_str.starts_with(".guixu-") && name_str.ends_with(".tmp") {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
             let mut watchers = HashMap::new();
             if let Some(root) = database.latest_library_root()? {
                 if let Ok(watcher) = PlatformWatcher::start(Path::new(&root.root_path)) {
@@ -1187,15 +2868,25 @@ pub fn run() {
                 database_path,
                 watchers: Mutex::new(watchers),
             });
+            // P1 启动恢复：消费崩溃遗留的 queued 任务。
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || while run_one_job(handle.clone()) {});
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             runtime_info,
+            app_settings,
+            save_app_settings,
+            local_data_status,
+            clear_hash_cache,
             active_library,
             select_library_folder,
             rescan_library,
             files_page,
             library_overview,
+            cleanup_suggestions,
             preview_file,
             open_file,
             reveal_file,
@@ -1209,10 +2900,21 @@ pub fn run() {
             save_smart_folder,
             delete_smart_folder,
             create_organize_plan,
+            create_rename_plan,
+            create_copy_plan,
+            create_move_plan,
+            create_trash_plan,
             execute_organize_plan,
+            execute_rename_plan,
+            execute_copy_plan,
+            execute_move_plan,
+            execute_trash_plan,
             operation_history,
             undo_operation,
-            exact_duplicates
+            start_similarity_analysis,
+            similarity_result,
+            start_exact_duplicate_analysis,
+            exact_duplicate_result
         ])
         .run(tauri::generate_context!())
         .expect("归序桌面程序启动失败");
@@ -1247,5 +2949,27 @@ mod tests {
         fs::write(&target, b"target").expect("write target");
         std::os::unix::fs::symlink(&target, &link).expect("create link");
         assert!(validate_authorized_path(library.path(), &link).is_err());
+    }
+
+    #[test]
+    fn plan_execution_commands_enforce_the_expected_operation_kind() {
+        assert!(ensure_plan_kind(FileOperationKind::Rename, FileOperationKind::Rename).is_ok());
+        assert!(ensure_plan_kind(FileOperationKind::Rename, FileOperationKind::Organize).is_err());
+        assert!(ensure_plan_kind(FileOperationKind::Move, FileOperationKind::Move).is_ok());
+        assert!(ensure_plan_kind(FileOperationKind::Copy, FileOperationKind::Move).is_err());
+    }
+
+    #[test]
+    fn app_settings_keep_backward_compatible_defaults() {
+        let settings: AppSettingsView = serde_json::from_str(
+            r#"{"defaultViewMode":"grid","pageSize":50,"refreshIntervalMs":5000}"#,
+        )
+        .expect("deserialize earlier settings payload");
+
+        assert!(settings.restore_last_library);
+        assert_eq!(settings.default_view_mode, "grid");
+        assert_eq!(settings.default_sort_key, "name");
+        assert_eq!(settings.default_sort_direction, "asc");
+        assert_eq!(settings.page_size, 50);
     }
 }

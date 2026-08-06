@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "归序主窗口权限：core:default 提供 IPC invoke、事件与窗口 API 的默认子集；监听后端任务状态事件用于任务中心实时刷新。",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

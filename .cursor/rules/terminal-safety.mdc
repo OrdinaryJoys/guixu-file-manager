@@ -1,0 +1,27 @@
+---
+description: Protect long-running terminal commands from Cursor terminal loss
+alwaysApply: true
+---
+
+以下任务不得直接运行在 Cursor Agent 的临时终端中：
+
+- 开发服务器
+- watch 模式测试
+- Docker 或数据库服务
+- Claude Code CLI
+- 持续日志监听
+- 数据迁移
+- 超过 30 秒的构建
+- 任何不能意外中断的任务
+
+若本机安装了 tmux，必须通过 cursor-safe-run 或独立 tmux 会话运行。
+
+执行后必须报告：
+
+1. tmux 会话名称
+2. 查看输出的方法
+3. 重新连接命令
+4. 安全停止命令
+
+不得自动杀死已有 tmux 会话。
+若 tmux 未安装，先告知用户并避免在 Agent 临时终端运行不可中断任务。

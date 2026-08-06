@@ -62,6 +62,68 @@ pub struct FileRecord {
     pub snapshot: FileSnapshot,
 }
 
+/// 用户发起的文件操作类型。计划、执行记录和 UI 必须共享同一语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOperationKind {
+    Organize,
+    Rename,
+    Move,
+    Copy,
+    Trash,
+}
+
+impl FileOperationKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Organize => "organize",
+            Self::Rename => "rename",
+            Self::Move => "move",
+            Self::Copy => "copy",
+            Self::Trash => "trash",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "organize" => Some(Self::Organize),
+            "rename" => Some(Self::Rename),
+            "move" => Some(Self::Move),
+            "copy" => Some(Self::Copy),
+            "trash" => Some(Self::Trash),
+            _ => None,
+        }
+    }
+}
+
+/// 目标冲突的处理方式。当前执行器只开放 `Abort`，其余策略须单独验收后启用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictPolicy {
+    Abort,
+    Skip,
+    KeepBoth,
+}
+
+impl ConflictPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Abort => "abort",
+            Self::Skip => "skip",
+            Self::KeepBoth => "keep_both",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "abort" => Some(Self::Abort),
+            "skip" => Some(Self::Skip),
+            "keep_both" => Some(Self::KeepBoth),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
@@ -77,6 +139,8 @@ pub enum PlanStatus {
 pub struct Plan {
     pub id: PlanId,
     pub library_id: LibraryId,
+    pub operation_kind: FileOperationKind,
+    pub conflict_policy: ConflictPolicy,
     pub status: PlanStatus,
     pub created_at_ms: i64,
     pub expires_at_ms: i64,
