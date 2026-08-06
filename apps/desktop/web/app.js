@@ -315,6 +315,9 @@ const state = {
 
 const listRequests = new LatestRequestGate();
 const previewRequests = new LatestRequestGate();
+// P3 扩展：概览统计与智能文件夹列表同样按资料库上下文加门，切库时旧响应不得覆盖新库内容。
+const overviewRequests = new LatestRequestGate();
+const smartFolderRequests = new LatestRequestGate();
 
 const elements = {
   runtime: document.querySelector('#runtime'),
@@ -465,6 +468,8 @@ function setNotice(message, kind = 'info') {
 function setLibrary(library) {
   listRequests.invalidate();
   previewRequests.invalidate();
+  overviewRequests.invalidate();
+  smartFolderRequests.invalidate();
   state.loading = false;
   state.library = library;
   elements.libraryName.textContent = library?.name || '我的资料库';
@@ -544,14 +549,18 @@ async function loadOverview() {
     elements.overviewLatest.textContent = '—';
     return;
   }
+  const libraryId = state.library.id;
+  const token = overviewRequests.begin();
   try {
-    const overview = await invoke('library_overview', { libraryId: state.library.id });
+    const overview = await invoke('library_overview', { libraryId });
+    if (!overviewRequests.isCurrent(token) || state.library?.id !== libraryId) return;
     elements.overviewFiles.textContent = Number(overview.totalFiles).toLocaleString('zh-CN');
     elements.overviewSize.textContent = formatBytes(overview.totalBytes);
     elements.overviewLatest.textContent = overview.latestModifiedAtNs === null
       ? '暂无'
       : formatDate(overview.latestModifiedAtNs);
   } catch (error) {
+    if (!overviewRequests.isCurrent(token) || state.library?.id !== libraryId) return;
     elements.overviewFiles.textContent = '不可用';
     elements.overviewSize.textContent = '不可用';
     elements.overviewLatest.textContent = '不可用';
@@ -826,8 +835,11 @@ async function showAllFiles() {
 async function loadSmartFolders() {
   elements.smartFolders.replaceChildren();
   if (!state.library) return;
+  const libraryId = state.library.id;
+  const token = smartFolderRequests.begin();
   try {
-    const folders = await invoke('smart_folders', { libraryId: state.library.id });
+    const folders = await invoke('smart_folders', { libraryId });
+    if (!smartFolderRequests.isCurrent(token) || state.library?.id !== libraryId) return;
     folders.forEach((folder) => {
       const row = document.createElement('div');
       row.className = 'smart-folder-row';
@@ -857,6 +869,7 @@ async function loadSmartFolders() {
     });
     setActiveNavigation(state.activeSmartFolderId);
   } catch (error) {
+    if (!smartFolderRequests.isCurrent(token) || state.library?.id !== libraryId) return;
     setNotice(`读取智能文件夹失败：${String(error)}`, 'error');
   }
 }
@@ -1224,13 +1237,14 @@ function renderHistory(operations, operationKind = null) {
     detail.textContent = operation.errorMessage
       || operation.items.map((item) => `${item.sourcePath} → ${item.targetPath}`).join('\n');
     card.append(head, detail);
-    if (operation.status === 'completed') {
+    if (operation.status === 'completed' || operation.status === 'recovery_needed') {
       const actions = document.createElement('div');
       actions.className = 'history-actions';
       const undo = document.createElement('button');
       undo.type = 'button';
       undo.className = 'quiet-button';
-      undo.textContent = '撤销此次操作';
+      // P1 恢复闭环：recovery_needed 只回滚已发布的条目，失败条目及其占位目标保持原样。
+      undo.textContent = operation.status === 'recovery_needed' ? '撤销已完成的变更' : '撤销此次操作';
       undo.addEventListener('click', () => undoHistoryOperation(operation.id, undo));
       actions.append(undo);
       card.append(actions);

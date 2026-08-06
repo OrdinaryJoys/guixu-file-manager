@@ -2151,6 +2151,121 @@ mod tests {
         );
     }
 
+    // P1 恢复闭环：recovery_needed 允许撤销，且只回滚已发布的条目；
+    // 失败条目的源文件与外部占位目标必须保持原样。
+    #[test]
+    fn undo_recovery_needed_rolls_back_only_the_completed_item() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        let sources = [root.join("first.txt"), root.join("second.txt")];
+        fs::write(&sources[0], b"first payload").expect("first source");
+        fs::write(&sources[1], b"second payload").expect("second source");
+        let targets = [
+            root.join("sorted/first.txt"),
+            root.join("sorted/second.txt"),
+        ];
+        let observed = sources
+            .iter()
+            .map(|source| observe_file(source).expect("observe source"))
+            .collect::<Vec<_>>();
+        let mut database =
+            Database::open(directory.path().join("fault.sqlite3")).expect("database");
+        database
+            .connection()
+            .execute(
+                "INSERT INTO libraries(id,name,created_at_ms,updated_at_ms) VALUES('library','测试',1,1)",
+                [],
+            )
+            .expect("library fixture");
+        for index in 0..2 {
+            database
+                .reconcile_file(
+                    "library",
+                    &format!("file-{index}"),
+                    sources[index].to_str().expect("source path"),
+                    &observed[index].identity,
+                    &observed[index].snapshot,
+                    5,
+                )
+                .expect("index fixture");
+        }
+        let items = (0..2)
+            .map(|index| NewPlanItem {
+                ordinal: index as i64,
+                file_id: format!("file-{index}"),
+                source_path: sources[index].to_string_lossy().into_owned(),
+                target_path: targets[index].to_string_lossy().into_owned(),
+                expected_identity: observed[index].identity.clone(),
+                expected_snapshot: observed[index].snapshot.clone(),
+            })
+            .collect::<Vec<_>>();
+        database
+            .create_plan(NewPlan {
+                id: "recovery-undo-plan",
+                library_id: "library",
+                operation_kind: FileOperationKind::Organize,
+                conflict_policy: ConflictPolicy::Abort,
+                created_at_ms: 10,
+                expires_at_ms: 1_000,
+                items: &items,
+            })
+            .expect("plan fixture");
+
+        // 第二个条目目标被外部文件占位 → 首条目已发布，操作进入 recovery_needed。
+        let result = execute_stored_plan_with_hook(
+            &mut database,
+            &root,
+            "recovery-undo-plan",
+            "recovery-undo-operation",
+            20,
+            |ordinal, intent| {
+                if ordinal == 1 {
+                    fs::create_dir_all(intent.target.parent().expect("target parent"))?;
+                    fs::write(&intent.target, b"external file appeared")?;
+                }
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(WorkflowError::ItemFailed { ordinal: 1, .. })
+        ));
+        assert_eq!(
+            database
+                .operation("recovery-undo-operation")
+                .expect("operation query")
+                .expect("operation")
+                .status,
+            "recovery_needed"
+        );
+
+        // 撤销只回滚已发布的条目，失败条目及其占位目标保持原样。
+        let report = undo_stored_operation(&mut database, &root, "recovery-undo-operation", 30)
+            .expect("undo recovery operation");
+        assert_eq!(report.completed_items, 1);
+        assert_eq!(report.total_items, 2);
+        assert!(sources[0].exists(), "已发布条目应回滚回原路径");
+        assert!(!targets[0].exists(), "已发布条目目标应已清空");
+        assert!(sources[1].exists(), "失败条目的源文件不得被移动");
+        assert_eq!(
+            fs::read(&targets[1]).expect("conflict target"),
+            b"external file appeared",
+            "外部占位文件不得被撤销逻辑删除"
+        );
+        let operation = database
+            .operation("recovery-undo-operation")
+            .expect("operation query")
+            .expect("operation");
+        assert_eq!(operation.status, "rolled_back");
+        let statuses: Vec<&str> = operation
+            .items
+            .iter()
+            .map(|item| item.status.as_str())
+            .collect();
+        assert_eq!(statuses, ["rolled_back", "failed"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn injected_symlinked_target_directory_cannot_escape_authorized_root() {

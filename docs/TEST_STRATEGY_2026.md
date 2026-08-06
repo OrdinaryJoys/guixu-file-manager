@@ -8,7 +8,7 @@
 
 | 门禁 | 结果 | 证明范围 |
 | --- | --- | --- |
-| `cargo test --workspace` | 91 项通过，0 失败 | Rust 算法、索引、存储迁移、任务状态机、文件操作与恢复的现有用例 |
+| `cargo test --workspace` | 92 项通过，0 失败 | Rust 算法、索引、存储迁移、任务状态机、文件操作与恢复的现有用例 |
 | `cargo fmt --all -- --check` | 通过 | Rust 格式一致性 |
 | 严格 Clippy（全部 target/feature） | 通过 | 当前 Rust 编译路径无 warning |
 | JS 语法检查 | 通过 | `app.js` 可解析，不代表交互正确 |

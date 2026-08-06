@@ -61,6 +61,21 @@ check(config.build?.frontendDist === '../web', 'Tauri frontendDist 必须指向�
 check(launcher.includes('apps/desktop/web'), 'start.command 必须启动与 Tauri 相同的前端目录');
 check(launcher.includes('?demo=1'), '浏览器启动器必须显式启用 demo 适配层');
 
+// P1 恢复闭环：recovery_needed 操作必须在历史卡片提供"撤销已完成的变更"入口，
+// 且概览/智能文件夹加载必须使用请求门（P3 扩展），防止切库旧响应覆盖。
+check(
+  js.includes("operation.status === 'completed' || operation.status === 'recovery_needed'"),
+  '历史卡片必须为 recovery_needed 提供撤销入口'
+);
+check(
+  js.includes("overviewRequests.isCurrent(token)"),
+  'loadOverview 必须使用请求门提交，防止旧资料库统计覆盖新库'
+);
+check(
+  js.includes("smartFolderRequests.isCurrent(token)"),
+  'loadSmartFolders 必须使用请求门提交，防止旧资料库列表覆盖新库'
+);
+
 if (failures.length) {
   console.error(failures.map((failure) => `- ${failure}`).join('\n'));
   process.exitCode = 1;

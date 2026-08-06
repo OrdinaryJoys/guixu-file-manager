@@ -45,7 +45,7 @@ for (const file of files) {
 }
 
 const currentSources = required.map((path) => readFileSync(resolve(repository, path), 'utf8')).join('\n');
-for (const marker of ['91 项', '7 项', '8 场景', '3/3 通过']) {
+for (const marker of ['92 项', '7 项', '8 场景', '3/3 通过']) {
   if (!currentSources.includes(marker)) errors.push(`当前文档缺少验证基线：${marker}`);
 }
 if (/\b89\s*(?:项|个)\s*Rust/u.test(currentSources)) {
